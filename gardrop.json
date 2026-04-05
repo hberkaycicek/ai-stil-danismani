@@ -1,0 +1,49 @@
+{
+  "ayakkabi": [
+    {
+      "dosya": "ayakkabı1.jpeg",
+      "aciklama": "Beyaz ve gri renk detaylarına sahip, sportif tasarımlı bir spor ayakkabı."
+    }
+  ],
+  "pantolon_kot": [
+    {
+      "dosya": "kot1.jpeg",
+      "aciklama": "Siyah renkli, dar kesim (slim fit) erkek jean pantolon."
+    },
+    {
+      "dosya": "kot2.jpeg",
+      "aciklama": "Mavi renkli, düz kesim bir kot pantolon."
+    },
+    {
+      "dosya": "image.png",
+      "aciklama": "Siyah renkli, vücuda oturan dar kesim bir kot pantolon."
+    },
+    {
+      "dosya": "kot3.jpeg",
+      "aciklama": "Açık mavi tonlarında, dar kesim modern bir denim pantolon."
+    }
+  ],
+  "gomlek_tshirt": [
+    {
+      "dosya": "gömlek3.jpeg",
+      "aciklama": "Bej rengi, keten görünümlü, uzun kollu erkek gömleği."
+    },
+    {
+      "dosya": "thsirt3.jpeg",
+      "aciklama": "Kısa kollu, bisiklet yaka siyah renkli tişört."
+    },
+    {
+      "dosya": "thsirt2.jpeg",
+      "aciklama": "Bej renkli, üzerinde küçük bir palmiye ağacı grafiği bulunan kısa kollu tişört."
+    },
+    {
+      "dosya": "gömlek2.jpeg",
+      "aciklama": "Koyu gri renkli, düğmeli, uzun kollu şık bir gömlek."
+    },
+    {
+      "dosya": "tshirt1.jpeg",
+      "aciklama": "siyah bisiklet yaka t-shirt"
+    }
+  ],
+  "polar_ceket": []
+}
