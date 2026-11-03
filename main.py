@@ -1,3 +1,27 @@
+# Üretim modelleri, formüller ve tahminler burada yeniden kurulur (Bölüm 14 çalışmasa da grafikler çıkar).
+URETIM, FORMUL = {}, {}
+gelecek = d[d["BOLGE"] == "TAHMIN"].sort_values("AY")
+TAHMIN = gelecek[["DONEM_1", "AY", "GOZLENEN_AY"]].reset_index(drop=True)
+TAHMIN["KISMI_GERCEK"] = gelecek[HEDEF].to_numpy()
+for rol, spec in MODELLER.items():
+    kol_ = spec["kolonlar"]
+    uret_df = olgun_df.dropna(subset=kol_)
+    m = pipe_fit(model_fabrika(spec["aile"], spec["params"]), uret_df[kol_], uret_df[HEDEF], agirlik_al(uret_df))
+    URETIM[rol] = m
+    if hasattr(m[-1], "coef_"):
+        coef = np.ravel(m[-1].coef_) / m[0].scale_
+        b0 = float(np.ravel([m[-1].intercept_])[0] - np.dot(coef, m[0].mean_))
+        FORMUL[rol] = f"{HK} = {b0:.6f} " + " ".join(f"{c:+.6g}·{kisa_ad(k)}" for k, c in zip(kol_, coef))
+    X = gelecek[kol_]
+    ok = X.notna().all(axis=1).to_numpy()
+    ham = np.full(len(X), np.nan)
+    if ok.any():
+        ham[ok] = m.predict(X[ok])
+    ov = OVERLAY[rol]["deger"] if OVERLAY[rol]["uygula"] else 0.0
+    TAHMIN[f"{rol}_HAM"] = np.clip(ham, 0, 1)
+    TAHMIN[f"{rol}_DUZ"] = np.clip(ham - ov, 0, 1)
+
+
 def bolge_boya(ax, alanlar):
     for ad, (p0, p1) in alanlar.items():
         x0, x1 = ts(p0) - pd.Timedelta(days=15), ts(p1) + pd.Timedelta(days=15)
