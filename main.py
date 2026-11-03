@@ -1,90 +1,50 @@
-# DÜZELTME: her bilgi ayı için ayrı fold seti. Bloğun ilk kohortu "AY + bilgi_ayı" anında tahmin
-# edilir; eğitimde sadece hedefi o anda BELLİ olan kohortlar (AY + 12 < tahmin anı) kalır.
-# 2. ay modelinde 10, 3. ayda 9, 6. ayda 6 kohort eğitimden çıkar.
-MIN_TRAIN = CONFIG["MIN_TRAIN"]
-cv_df = d.loc[gel_idx].sort_values("AY").reset_index(drop=True)
-Y_CV = cv_df[HEDEF].to_numpy(dtype=float)
-AY_CV = pd.PeriodIndex(cv_df["AY"])
-AYNO_CV = AY_CV.asi8
-TOL = float(CONFIG["YON_TOLERANSI"])
+def ts(p):
+    return p.to_timestamp() if hasattr(p, "to_timestamp") else pd.Period(p, "M").to_timestamp()
 
 
-def fold_olustur(bilgi_ayi):
-    foldlar, ozet = [], []
-    tscv = TimeSeriesSplit(n_splits=CONFIG["N_SPLITS"], test_size=CONFIG["TEST_SIZE"])
-    for i, (tr, val) in enumerate(tscv.split(np.arange(len(cv_df))), 1):
-        ilk_tahmin = AY_CV[val[0]] + bilgi_ayi
-        tr = tr[(AY_CV[tr] + CONFIG["HEDEF_OLGUNLASMA_AY"] + CONFIG["RAPOR_GECIKME_AY"]) < ilk_tahmin]
-        foldlar.append((tr, val))
-        ozet.append({"FOLD": i, "EGITIM_N": len(tr), "EGITIM": f"{AY_CV[tr[0]]} – {AY_CV[tr[-1]]}",
-                     "BOSLUK (olgunlaşmamış)": int(val[0] - tr[-1] - 1),
-                     "VALIDASYON": f"{AY_CV[val[0]]} – {AY_CV[val[-1]]}", "TAHMIN_ANI": str(ilk_tahmin)})
-    return foldlar, pd.DataFrame(ozet)
+def takvim_grafigi(b, tahmin_araligi=None):
+    """Veri bölmesi + bilgi ayı b için walk-forward fold yapısı (taralı alan = olgunlaşma boşluğu)."""
+    def span(p0, p1):
+        a, c = mdates.date2num(ts(p0)), mdates.date2num(ts(p1 + 1))
+        return (a, c - a)
+    foldlar = fold_al(b)
+    val_bas = AY_CV[foldlar[0][1][0]]
+    olgun = d[d["HEDEF_KULLANILABILIR"]]
+    ust = [(span(olgun["AY"].min(), val_bas - 1), ARKA["EGITIM"], "Eğitim"),
+           (span(val_bas, AY_CV.max()), RENK["VALIDASYON"], "Validasyon"),
+           (span(d.loc[oot_idx, "AY"].min(), d.loc[oot_idx, "AY"].max()), RENK["OOT"], "OOT")]
+    gelecek = d.loc[d["BOLGE"] == "TAHMIN", "AY"]
+    if len(gelecek):
+        ust.append((span(gelecek.min(), gelecek.max()), RENK["TAHMIN"], "Tahmin"))
+    satir = [("Kohortlar", ust)]
+    for i, (tr, val) in enumerate(foldlar, 1):
+        parca = [(span(AY_CV[tr[0]], AY_CV[tr[-1]]), "#bfdbfe", None)]
+        if val[0] - tr[-1] > 1:
+            parca.append((span(AY_CV[tr[-1]] + 1, AY_CV[val[0]] - 1), "#e5e7eb", "hatch"))
+        parca.append((span(AY_CV[val[0]], AY_CV[val[-1]]), RENK["VALIDASYON"], None))
+        satir.append((f"CV Fold {i}", parca))
+    fig, ax = plt.subplots(figsize=(16, 4.2))
+    for yy, (ad, parcalar) in enumerate(reversed(satir)):
+        for (x, gen), renk, ek in parcalar:
+            ax.broken_barh([(x, gen)], (yy - 0.35, 0.7), facecolors=renk, edgecolor="white",
+                           hatch="///" if ek == "hatch" else None)
+            if isinstance(ek, str) and ek != "hatch":
+                ax.text(x + gen / 2, yy, ek, ha="center", va="center", fontsize=9, fontweight="bold",
+                        color="white" if renk != ARKA["EGITIM"] else "#334155")
+    ax.set_yticks(range(len(satir))); ax.set_yticklabels([s[0] for s in reversed(satir)])
+    ax.xaxis_date(); ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 7]))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m")); ax.grid(axis="x", alpha=0.3)
+    ax.legend(handles=[Patch(color="#bfdbfe", label="Fold eğitimi"),
+                       Patch(facecolor="#e5e7eb", hatch="///", label="Boşluk: hedef o tarihte henüz belli değil"),
+                       Patch(color=RENK["VALIDASYON"], label="Validasyon"), Patch(color=RENK["OOT"], label="OOT")],
+              loc="upper left", fontsize=8, ncol=4, bbox_to_anchor=(0, -0.12))
+    ax.set_title(f"Walk-forward yapı | bilgi ayı = {b} (öncül {b}. ayda belli, tahmin anı = kohort + {b} ay)",
+                 fontweight="bold", loc="left")
+    plt.tight_layout(); plt.show()
 
 
-FOLD_CACHE = {}
-def fold_al(b):
-    if b not in FOLD_CACHE:
-        FOLD_CACHE[b] = fold_olustur(b)[0]
-    return FOLD_CACHE[b]
-
-
-def wmape(y, p):
-    y, p = np.asarray(y, float), np.asarray(p, float)
-    return float(np.abs(p - y).sum() / max(np.abs(y).sum(), 1e-12) * 100)
-
-
-def agirlik_al(df):
-    kol = CONFIG["SAMPLE_WEIGHT_KOLON"]
-    return None if kol is None else df[kol].to_numpy(dtype=float)
-
-
-def pipe_fit(estimator, X, y, w=None):
-    p = make_pipeline(StandardScaler(), clone(estimator))
-    return p.fit(X, y) if w is None else p.fit(X, y, **{f"{p.steps[-1][0]}__sample_weight": w})
-
-
-def cv_degerlendir(kolonlar, estimator, foldlar=None):
-    kolonlar = list(kolonlar)
-    if foldlar is None:
-        foldlar = fold_al(bilgi_ayi_hesapla(kolonlar))
-    X, y = cv_df[kolonlar].to_numpy(dtype=float), Y_CV
-    dolu = ~np.isnan(X).any(axis=1)
-    hata, gercek, f_wmape, f_sapma, f_oran = [], [], [], [], []
-    d_g, d_t, aralik_disi, n_tr = [], [], 0, []
-    for tr, val in foldlar:
-        tr = tr[dolu[tr]]                                       # ilk kohortlarda boş olan ortalamalar
-        if len(tr) < MIN_TRAIN:
-            raise ValueError(f"eğitim yetersiz ({len(tr)} < {MIN_TRAIN})")
-        if not dolu[val].all():
-            raise ValueError("validasyonda boş değer")
-        w = None if CONFIG["SAMPLE_WEIGHT_KOLON"] is None else cv_df.iloc[tr][CONFIG["SAMPLE_WEIGHT_KOLON"]].to_numpy()
-        m = pipe_fit(estimator, X[tr], y[tr], w)
-        p, p_tr = m.predict(X[val]), m.predict(X[tr])
-        n_tr.append(len(tr))
-        f_wmape.append(wmape(y[val], p))
-        f_sapma.append(float(np.mean(p - y[val])))
-        f_oran.append(f_wmape[-1] / max(wmape(y[tr], p_tr), 1e-12))
-        aralik_disi += int(((p < 0) | (p > 2 * y[tr].max())).sum())
-        bit = np.diff(AYNO_CV[val]) == 1
-        d_g.extend(np.diff(y[val])[bit]); d_t.extend(np.diff(p)[bit])
-        hata.extend(p - y[val]); gercek.extend(y[val])
-    hata, gercek, d_g, d_t = map(np.asarray, (hata, gercek, d_g, d_t))
-    anlamli = np.abs(d_g) > TOL
-    dogru = np.sign(np.where(np.abs(d_t) <= TOL, 0, d_t))[anlamli] == np.sign(d_g[anlamli])
-    buy = np.abs(d_g[anlamli])
-    return {
-        "CV_WMAPE": float(np.abs(hata).sum() / gercek.sum() * 100),
-        "CV_MAE": float(np.mean(np.abs(hata))), "CV_SAPMA": float(np.mean(hata)),
-        "MUTLAK_FOLD_SAPMA": float(np.mean(np.abs(f_sapma))),
-        "EN_KOTU_WMAPE": float(np.max(f_wmape)), "FOLD_WMAPE_STD": float(np.std(f_wmape)),
-        "OVERFIT_ORANI": float(np.median(f_oran)),
-        "DELTA_MAE": float(np.mean(np.abs(d_t - d_g))) if len(d_g) else np.nan,
-        "YON_AGIRLIKLI": float((buy * dogru).sum() / buy.sum()) if anlamli.any() else np.nan,
-        "ARALIK_DISI": aralik_disi, "FOLD1_EGITIM_N": n_tr[0],
-    }
-
-
-DUMMY = cv_degerlendir([HAM_HAVUZ[0]], DummyRegressor(strategy="mean"), fold_al(0))
-print(f"Naif referans (geçmiş ortalama): CV_WMAPE {DUMMY['CV_WMAPE']:.2f} | "
-      f"EN_KOTU {DUMMY['EN_KOTU_WMAPE']:.2f} | MUTLAK_FOLD_SAPMA {DUMMY['MUTLAK_FOLD_SAPMA']:.4f}")
+for b in [2, 3, 6]:
+    print(f"=== Fold yapısı | bilgi ayı = {b} ===")
+    display(fold_olustur(b)[1])
+takvim_grafigi(2)
+takvim_grafigi(6)
