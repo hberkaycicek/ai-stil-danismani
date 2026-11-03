@@ -1,81 +1,106 @@
-class HizliDogrusalCV(BaseEstimator, RegressorMixin):
-    """Ridge / Lasso / ElasticNet: iç zamansal CV ile alpha (ve L1 oranı) seçimi, sonra tüm eğitime fit.
-    Ridge: SVD ile kapalı çözüm (tüm alpha yolu tek seferde). Lasso/EN: enet_path.
-    Her iç fold'da standartlaştırma sadece o fold'un eğitim kısmıyla yapılır."""
-
-    def __init__(self, aile="Ridge", alphalar=None, l1_oranlari=(1.0,), ic_cv=3, max_iter=100000, tol=1e-6):
-        self.aile, self.alphalar, self.l1_oranlari = aile, alphalar, l1_oranlari
-        self.ic_cv, self.max_iter, self.tol = ic_cv, max_iter, tol
-
-    @staticmethod
-    def _std(X, y):
-        mx, sx = X.mean(axis=0), X.std(axis=0)
-        sx = np.where(sx > 0, sx, 1.0)
-        return (X - mx) / sx, y - y.mean(), mx, sx, y.mean()
-
-    def _yol(self, Xs, yc, l1, alphalar):
-        if self.aile == "Ridge":
-            U, s, Vt = np.linalg.svd(Xs, full_matrices=False)
-            Uy = U.T @ yc
-            return np.stack([Vt.T @ (s / (s ** 2 + a) * Uy) for a in alphalar])
-        Xf = np.asfortranarray(Xs)                     # Gram matrisi önceden: küçük p için ~6 kat hızlı
-        _, coefs, _ = enet_path(Xf, yc, l1_ratio=l1, alphas=alphalar, max_iter=self.max_iter, tol=self.tol,
-                                check_input=False, precompute=Xf.T @ Xf, Xy=Xf.T @ yc)
-        return coefs.T
-
-    def fit(self, X, y, sample_weight=None):
-        X, y = np.asarray(X, float), np.asarray(y, float)
-        alphalar = np.sort(np.asarray(self.alphalar, float))[::-1]
-        l1s = [None] if self.aile == "Ridge" else list(self.l1_oranlari)
-        en_iyi = (np.inf, None, None)
-        for l1 in l1s:
-            mse = np.zeros(len(alphalar))
-            for tr, te in TimeSeriesSplit(n_splits=self.ic_cv).split(X):
-                Xs, yc, mx, sx, my = self._std(X[tr], y[tr])
-                B = self._yol(Xs, yc, l1, alphalar)
-                P = ((X[te] - mx) / sx) @ B.T + my
-                mse += ((P - y[te][:, None]) ** 2).mean(axis=0)
-            j = int(np.argmin(mse))
-            if mse[j] < en_iyi[0]:
-                en_iyi = (mse[j], alphalar[j], l1)
-        self.alpha_, self.l1_ratio_ = float(en_iyi[1]), en_iyi[2]
-        Xs, yc, mx, sx, my = self._std(X, y)
-        b = self._yol(Xs, yc, self.l1_ratio_, np.array([self.alpha_]))[0]
-        self.coef_ = b / sx
-        self.intercept_ = float(my - mx @ self.coef_)
-        return self
-
-    def predict(self, X):
-        return np.asarray(X, float) @ self.coef_ + self.intercept_
+def kayit_ekle(s, kolonlar, aile, params, satir=None):
+    kolonlar = list(kolonlar)
+    trend = int(TREND_KOL in kolonlar)
+    s.update({"GIRDILER": ", ".join(kisa_ad(c) for c in taban(kolonlar)), "MODEL": aile, "PARAMS": params,
+              "BILGI_AY": bilgi_ayi_hesapla(kolonlar), "TOPLAM_K": len(kolonlar),
+              "TREND": trend, "MEVSIM": int("SIN_AY" in kolonlar),
+              "ORTALAMA": next((f"AGORT{ORTALAMA_PENCERE[c]}" for c in kolonlar if c in ORTALAMA_KOL), "Yok"),
+              "KOLONLAR": tuple(kolonlar),
+              "SECILEBILIR": bool((not trend or CONFIG["TREND_SECILEBILIR"]) and aile in CONFIG["FORMUL_AILELERI"])})
+    return s
 
 
-def model_fabrika(aile, p=None):
-    p = p or {}
-    ortak = dict(alphalar=CONFIG["ALPHALAR"], ic_cv=CONFIG["IC_CV_SPLITS"],
-                 max_iter=CONFIG["MAX_ITER"], tol=CONFIG["MODEL_TOL"])
-    return {
-        "Dummy":       lambda: DummyRegressor(strategy="mean"),
-        "Linear":      lambda: LinearRegression(),
-        "Ridge":       lambda: HizliDogrusalCV("Ridge", **ortak),
-        "Lasso":       lambda: HizliDogrusalCV("Lasso", l1_oranlari=(1.0,), **ortak),
-        "ElasticNet":  lambda: HizliDogrusalCV("ElasticNet", l1_oranlari=tuple(CONFIG["L1_ORANLARI"]), **ortak),
-        "Ridge*":      lambda: Ridge(alpha=p["alpha"]),
-        "Lasso*":      lambda: Lasso(alpha=p["alpha"], max_iter=100000),
-        "ElasticNet*": lambda: ElasticNet(alpha=p["alpha"], l1_ratio=p["l1"], max_iter=100000),
-        "Huber":       lambda: HuberRegressor(epsilon=p["eps"], alpha=p["alpha"], max_iter=2000),
-        "SVR":         lambda: SVR(kernel=p["kernel"], C=p["C"], epsilon=p["eps"]),
-        "ExtraTrees":  lambda: ExtraTreesRegressor(n_estimators=300, max_depth=p["depth"],
-                                                   min_samples_leaf=p["leaf"], random_state=42),
-        "GBoost":      lambda: GradientBoostingRegressor(n_estimators=p["n"], learning_rate=p["lr"],
-                                                         max_depth=p["depth"], random_state=42),
-    }[aile]()
+def rank_ekle(df):
+    g = CONFIG["GECERLI"]
+    df = df.copy()
+    df["GECERLI"] = ((df["CV_WMAPE"] <= g["CV_WMAPE_DUMMY_ORAN"] * DUMMY["CV_WMAPE"])
+                     & (df["EN_KOTU_WMAPE"] <= g["EN_KOTU_DUMMY_ORAN"] * DUMMY["EN_KOTU_WMAPE"])
+                     & (df["OVERFIT_ORANI"] <= g["OVERFIT_ORANI_MAX"])
+                     & (df["MUTLAK_FOLD_SAPMA"] <= g["SAPMA_DUMMY_ORAN"] * DUMMY["MUTLAK_FOLD_SAPMA"])
+                     & (df["ARALIK_DISI"] == 0))
+    df["RANK_SKORU"] = np.nan
+    m = df["GECERLI"]
+    if m.any():
+        skor = 0.0
+        for kol, w in CONFIG["AGIRLIK"].items():
+            s = df.loc[m, kol].astype(float)
+            s = s.clip(lower=1.0) if kol == "OVERFIT_ORANI" else s
+            skor = skor + w * s.rank(pct=True).fillna(1.0)
+        df.loc[m, "RANK_SKORU"] = skor
+    return df.sort_values(["GECERLI", "RANK_SKORU", "CV_WMAPE"], ascending=[False, True, True]).reset_index(drop=True)
 
 
-# Doğrulama: aynı alpha'da motor = sklearn
-_X = StandardScaler().fit_transform(cv_df[[ONCULLER[1], KKB_KOL]].to_numpy(float))
-_kontrol = []
-for aile, sk, a, l1 in [("Ridge", Ridge(alpha=1.0), 1.0, None), ("Lasso", Lasso(alpha=1e-4, max_iter=100000), 1e-4, 1.0),
-                        ("ElasticNet", ElasticNet(alpha=1e-4, l1_ratio=0.5, max_iter=100000), 1e-4, 0.5)]:
-    hm = HizliDogrusalCV(aile, alphalar=[a], l1_oranlari=(l1 or 1.0,), tol=1e-10).fit(_X, Y_CV)
-    _kontrol.append({"AILE": aile, "MAKS_KATSAYI_FARKI": float(np.max(np.abs(hm.coef_ - sk.fit(_X, Y_CV).coef_)))})
-display(pd.DataFrame(_kontrol).style.format({"MAKS_KATSAYI_FARKI": "{:.2e}"}))
+def varyant_etiketi(df):
+    return np.select([(df["TREND"] == 1) & (df["MEVSIM"] == 1), df["TREND"] == 1, df["MEVSIM"] == 1],
+                     ["Trend+Mevsim", "Trend", "Mevsim"], "Yok")
+
+
+N_JOBS = 2          # paralel çekirdek sayısı (sorun çıkarsa 1 yap)
+GRUP_BOYUTU = 50
+
+
+def grup_calistir(grup):
+    warnings.filterwarnings("ignore")                   # paralel işçilerde de uyarıları kapat
+    kayit_, hata_ = [], []
+    for kolonlar in grup:
+        foldlar = fold_al(bilgi_ayi_hesapla(kolonlar))
+        for aile in CONFIG["MODEL_AILELERI"]:
+            try:
+                kayit_.append(kayit_ekle(cv_degerlendir(kolonlar, model_fabrika(aile), foldlar), kolonlar, aile, None))
+            except Exception as e:
+                hata_.append({"GIRDILER": ", ".join(map(kisa_ad, kolonlar)), "MODEL": aile, "HATA": str(e)[:80]})
+    return kayit_, hata_
+
+
+for b in range(0, CONFIG["CHAMPION_MAX_AY"] + 1):        # fold'lar önceden hazır olsun (paralel işçiler için)
+    fold_al(b)
+adaylar = list(ADAY_TABLO["KOLONLAR"])
+gruplar = [adaylar[i:i + GRUP_BOYUTU] for i in range(0, len(adaylar), GRUP_BOYUTU)]
+t0, kayit, hatalar = time.time(), [], []
+if N_JOBS > 1:
+    from joblib import Parallel, delayed
+    parca = N_JOBS * 4
+    for i in range(0, len(gruplar), parca):
+        for k_, h_ in Parallel(n_jobs=N_JOBS)(delayed(grup_calistir)(g) for g in gruplar[i:i + parca]):
+            kayit += k_; hatalar += h_
+        print(f"  {min((i + parca) * GRUP_BOYUTU, len(adaylar)):,}/{len(adaylar):,} aday | {time.time() - t0:.0f} sn")
+else:
+    for i, g in enumerate(gruplar, 1):
+        k_, h_ = grup_calistir(g)
+        kayit += k_; hatalar += h_
+        if i % 10 == 0:
+            print(f"  {i * GRUP_BOYUTU:,}/{len(adaylar):,} aday | {time.time() - t0:.0f} sn")
+grid_ham = pd.DataFrame(kayit)
+grid = rank_ekle(grid_ham)
+grid["VARYANT"] = varyant_etiketi(grid)
+print(f"{len(grid):,} değerlendirme | geçerli {int(grid['GECERLI'].sum()):,} | elenen {len(hatalar)} | "
+      f"{(time.time() - t0) / 60:.1f} dk")
+if hatalar:
+    print("Elenme nedenleri:", pd.DataFrame(hatalar)["HATA"].value_counts().to_dict())
+
+GOSTER = ["GIRDILER", "MODEL", "BILGI_AY", "TOPLAM_K", "TREND", "MEVSIM", "ORTALAMA", "CV_WMAPE",
+          "EN_KOTU_WMAPE", "FOLD_WMAPE_STD", "OVERFIT_ORANI", "DELTA_MAE", "CV_SAPMA", "MUTLAK_FOLD_SAPMA",
+          "YON_AGIRLIKLI", "FOLD1_EGITIM_N", "GECERLI", "SECILEBILIR", "RANK_SKORU"]
+FMT = {**{c: "{:.2f}" for c in ["CV_WMAPE", "EN_KOTU_WMAPE", "FOLD_WMAPE_STD"]},
+       **{c: "{:.4f}" for c in ["OVERFIT_ORANI", "DELTA_MAE", "CV_SAPMA", "MUTLAK_FOLD_SAPMA",
+                                "YON_AGIRLIKLI", "RANK_SKORU"]}}
+print("=== Bileşik skora göre ilk 15 ===")
+display(grid[GOSTER].head(15).style.format(FMT, decimal=","))
+
+
+def grup_ozet(df, by):
+    out = df.groupby(by).agg(VARYANT=("CV_WMAPE", "size"), EN_IYI_CV_WMAPE=("CV_WMAPE", "min"),
+                             MEDYAN_CV_WMAPE=("CV_WMAPE", "median"))
+    out["GECERLI"] = df[df["GECERLI"]].groupby(by).size().reindex(out.index).fillna(0).astype(int)
+    return out[["VARYANT", "GECERLI", "EN_IYI_CV_WMAPE", "MEDYAN_CV_WMAPE"]]
+
+
+OZET_VARYANT = grup_ozet(grid, "VARYANT").reindex(["Yok", "Mevsim", "Trend", "Trend+Mevsim"]).dropna(how="all")
+OZET_BILGI_AY = grup_ozet(grid, "BILGI_AY")
+OZET_AILE = grup_ozet(grid, "MODEL")
+OZET_ORTALAMA = grup_ozet(grid, "ORTALAMA")
+OZET_K = grup_ozet(grid, "TOPLAM_K")
+for ad, t in [("Takvim (trend / mevsim)", OZET_VARYANT), ("Bilgi ayı (en geç öncül)", OZET_BILGI_AY),
+              ("Model ailesi", OZET_AILE), ("Geçmiş ortalama", OZET_ORTALAMA), ("Toplam girdi sayısı", OZET_K)]:
+    print(f"=== {ad} ===")
+    display(t.style.format({"EN_IYI_CV_WMAPE": "{:.2f}", "MEDYAN_CV_WMAPE": "{:.2f}"}, decimal=",", na_rep="-"))
