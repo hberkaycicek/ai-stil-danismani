@@ -923,3 +923,4 @@ print("Dönüşüm  :", " | ".join(f"{i}: " + ", ".join(f"{k.split('/')[1]}={v:.
                                for i, r_ in DONUSUM.iterrows()))
 print("=" * 100)
 # ADETSEL için: CONFIG["HEDEF_TUR"] = "ADETSEL" yapıp Bölüm 2'den itibaren tekrar çalıştır.
+    
