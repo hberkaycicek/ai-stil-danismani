@@ -1,92 +1,89 @@
-CONFIG = {
-    # Hedef
-    "HEDEF_TUR": "TUTARSAL",
-    "HEDEF_SON": "90_12",
+def veri_hazirla(df_raw, config):
+    tur = config["HEDEF_TUR"]
+    hedef = oncul_kolon(config["HEDEF_SON"], tur)
+    onculler = [oncul_kolon(k, tur) for k in ONCU_KODLARI]
+    k90 = sorted([c for c in df_raw.columns if c.startswith("KK_TAKIP_90_") and c.endswith(f"_{tur}")
+                  and c.split("_")[3].isdigit() and int(c.split("_")[3]) < 12],
+                 key=lambda c: int(c.split("_")[3]))
+    ham_ortak = [c for c in ORTAK_ALANLAR if c != "ORTALAMA_LIMIT"]
+    ek = [config[k] for k in ["LIMIT_KOLON", "LIMIT_PAYDA_KOLON", "ORTALAMA_AGIRLIK_KOLON",
+                              "SAMPLE_WEIGHT_KOLON", "TUFE_KOLON"] if config[k]]
+    gerekli = list(dict.fromkeys(["DONEM_1", hedef, *onculler, *ham_ortak, *ek, *k90]))
+    eksik = sorted(set(gerekli) - set(df_raw.columns))
+    if eksik:
+        raise ValueError(f"Eksik kolon: {eksik}")
+    if any("_90_" in k for k in onculler + ORTAK_ALANLAR):
+        raise ValueError("90+ alanı girdi olamaz.")
 
-    # Bölme (zaman bazlı)
-    "GELISTIRME_ARALIK": (202101, 202409),    # eğitim + walk-forward CV + model seçimi
-    "OOT_ARALIK": (202410, 202509),           # seçimde hiç kullanılmaz, sadece ölçüm
+    d = df_raw[gerekli].copy()
+    d["AY"] = pd.to_datetime(d["DONEM_1"].astype(str), format="%Y%m").dt.to_period("M")
+    d = d.sort_values("AY").reset_index(drop=True)
+    if d["AY"].duplicated().any():
+        raise ValueError("Tekrarlanan kohort var.")
+    tam = pd.period_range(d["AY"].min(), d["AY"].max(), freq="M")
+    if len(tam) != len(d):
+        raise ValueError(f"Eksik ay: {sorted(set(tam.astype(str)) - set(d['AY'].astype(str)))}")
+    sayisal = [c for c in gerekli if c != "DONEM_1"]
+    d[sayisal] = d[sayisal].apply(pd.to_numeric, errors="raise")
 
-    # Olgunlaşma: M kohortunun 12. ay verisi M+12 ayının ilk haftasında gelir (202509 -> 202610)
-    "BILGI_AYI": "2026-10",
-    "HEDEF_OLGUNLASMA_AY": 12,
-    "RAPOR_GECIKME_AY": 0,
+    payda = d[config["LIMIT_PAYDA_KOLON"]].where(d[config["LIMIT_PAYDA_KOLON"]] > 0)
+    d["ORTALAMA_LIMIT"] = d[config["LIMIT_KOLON"]] / payda
+    if config["TUFE_KOLON"]:
+        d["ORTALAMA_LIMIT"] = d["ORTALAMA_LIMIT"] / d[config["TUFE_KOLON"]] * 100
 
-    # Walk-forward CV (her bilgi ayı için ayrı fold seti, olgunlaşma boşluklu)
-    "N_SPLITS": 5, "TEST_SIZE": 4,
-    "MIN_TRAIN": 9,                           # AGORT6 + 2. ayda Fold1 eğitimi 9 kohort (Bölüm 7)
-    "IC_CV_SPLITS": 3,
+    orijin = pd.Period(config["TREND_ORIJIN"], freq="M")
+    d[TREND_KOL] = d["AY"].apply(lambda p: (p - orijin).n).astype(float)
+    d["SIN_AY"] = np.sin(2 * np.pi * d["AY"].dt.month / 12)
+    d["COS_AY"] = np.cos(2 * np.pi * d["AY"].dt.month / 12)
 
-    # Aday havuzu
-    "CHAMPION_MAX_AY": 6, "CHALLENGER_MAX_AY": 3,
-    "MAX_K": 2, "AYNI_AYDAN_TEK_ONCUL": True,
-    "MODEL_AILELERI": ["Linear", "Ridge", "Lasso", "ElasticNet"],
-    "ALPHALAR": np.logspace(-6, 3, 61),
-    "L1_ORANLARI": [0.1, 0.3, 0.5, 0.7, 0.9],  # 1.0 = Lasso (ayrı aile)
-    "MAX_ITER": 100000, "MODEL_TOL": 1e-6,
+    bilgi = pd.Period(config["BILGI_AYI"], freq="M")
+    gec = config["RAPOR_GECIKME_AY"]
+    d["HEDEF_ERISIM"] = d["AY"] + config["HEDEF_OLGUNLASMA_AY"] + gec       # hedefin belli olduğu ay
+    gecerli_hedef = d[hedef].notna() & np.isfinite(d[hedef]) & d[hedef].between(0, 1)
+    d["HEDEF_KULLANILABILIR"] = (d["HEDEF_ERISIM"] < bilgi) & gecerli_hedef
+    d["GOZLENEN_AY"] = d["AY"].apply(lambda p: (bilgi - p).n) - 1 - gec
 
-    # Takvim
-    "TREND_DENE": True,                       # rapor için denenir
-    "TREND_SECILEBILIR": False,               # DÜZELTME: trend geleceğe doğrusal uzanır -> seçilemez
-    "TREND_ORIJIN": "2021-01",
-    "MEVSIM_DENE": True,
-    "YON_TOLERANSI": 0.0005,
+    kismi = {}
+    for k, kol in zip(ONCU_KODLARI, onculler):                               # bugün tamamlanmamış öncül -> NaN
+        tam_mi = (d["AY"] + oncul_ay(k) + gec) < bilgi
+        if (~tam_mi & d[kol].notna()).any():
+            kismi[kisa_ad(kol)] = int((~tam_mi & d[kol].notna()).sum())
+        d.loc[~tam_mi, kol] = np.nan
+    if kismi:
+        print("Kısmi (tamamlanmamış) öncül değeri NaN yapıldı:", kismi)
+    if ((d[onculler] < 0) | (d[onculler] > 1)).sum().sum():
+        raise ValueError("0-1 dışında oran girdisi var.")
+    na = d.loc[d["HEDEF_KULLANILABILIR"], onculler + ORTAK_ALANLAR].isna().sum()
+    if na.any():
+        print("UYARI - olgun kohortlarda boş girdi:\n", na[na > 0].to_string())
+    return d, hedef, onculler, k90
 
-    # Geçmiş kohort ortalamaları (limit ağırlıklı, sadece önceki kohortlar)
-    "ORTALAMA_DENE": True,
-    "ORTALAMA_PENCERELERI": [3, 6],
-    "MAX_ORTALAMA": 1,
-    "ORTALAMA_TAM_PENCERE": True,
-    "ORTALAMA_GECIKME": 1,
-    "ORTALAMA_AGIRLIK_KOLON": "TOPLAM_ONAYLANAN_LIMIT",
-    "LIMIT_KOLON": "TOPLAM_ONAYLANAN_LIMIT",
-    "LIMIT_PAYDA_KOLON": "BASVURU_ADEDI",
-    "TUFE_KOLON": None, "SAMPLE_WEIGHT_KOLON": None,
 
-    # Sıralama ve geçerlilik (naif ortalama modeline göre)
-    "AGIRLIK": {"CV_WMAPE": 0.30, "EN_KOTU_WMAPE": 0.12, "FOLD_WMAPE_STD": 0.12,
-                "OVERFIT_ORANI": 0.15, "DELTA_MAE": 0.12, "MUTLAK_FOLD_SAPMA": 0.19},
-    "GECERLI": {"CV_WMAPE_DUMMY_ORAN": 0.50, "EN_KOTU_DUMMY_ORAN": 0.75,
-                "OVERFIT_ORANI_MAX": 2.0, "SAPMA_DUMMY_ORAN": 0.35},
+def bolme_uygula(d, config):
+    kullan = d[d["HEDEF_KULLANILABILIR"]]
+    gel = kullan.index[kullan["DONEM_1"].between(*config["GELISTIRME_ARALIK"])].to_numpy()
+    oot = kullan.index[kullan["DONEM_1"].between(*config["OOT_ARALIK"])].to_numpy()
+    disarida = kullan.index.difference(np.concatenate([gel, oot]))
+    if len(disarida):
+        print("UYARI - bölgeye atanmamış olgun kohort:", list(kullan.loc[disarida, "DONEM_1"]))
+    if len(gel) == 0 or len(oot) == 0 or len(set(gel) & set(oot)):
+        raise ValueError("Geliştirme/OOT bölmesi hatalı.")
+    if d.loc[gel, "AY"].max() >= d.loc[oot, "AY"].min():
+        raise ValueError("OOT geliştirmeden sonra başlamalı.")
+    return gel, oot
 
-    # Seçim: anlamlılık (HAC, sadece geliştirme verisi) + 1-SE + sadelik
-    "HAC_P_ESIK": 0.10,
-    "HAC_ILK_N": 1000,
-    "CHALLENGER_FARKLI_GIRDI": True,
-    "REFERANS": {"girdiler": ["30_2", "KKB"], "aile": "Linear"},   # v4 champion, kıyas için
 
-    # Optuna (sağlamlık kontrolü; doğrusal olmayan aileler raporlanır, seçilemez)
-    "OPTUNA_CALISTIR": True, "OPTUNA_TRIALS": 60, "OPTUNA_SET_SAYISI": 20,
-    "FORMUL_AILELERI": ["Linear", "Ridge", "Lasso", "ElasticNet", "Ridge*", "Lasso*",
-                        "ElasticNet*", "Huber"],
-
-    # Seviye düzeltmesi (overlay)
-    "OVERLAY_PENCERE": 12, "OVERLAY_MIN_AYNI_ISARET": 10,
-}
-
-KKB_KOL = next((c for c in ["KKB_SKOR_O0120", "KKB_SKOR_00120"] if c in df_raw.columns), "KKB_SKOR_O0120")
-ORTAK_ALANLAR = [KKB_KOL, "MM_SKOR", "KALIBRE_PD_AGIRLIKLI", "ORTALAMA_LIMIT"]
-ONCU_KODLARI = ["20_2", "30_2", "30_3", "60_3", "30_4", "60_4", "30_5", "60_5", "30_6", "60_6"]
-MEVSIM_KOL, TREND_KOL = ["SIN_AY", "COS_AY"], "TREND_IDX"
-TAKVIM_KOL = MEVSIM_KOL + [TREND_KOL]
-
-oncul_kolon = lambda kod, tur=None: f"KK_TAKIP_{kod}_{tur or CONFIG['HEDEF_TUR']}"
-oncul_ay = lambda kod: int(kod.split("_")[1])
-kisa_ad = lambda k: k.replace("KK_TAKIP_", "").replace(f"_{CONFIG['HEDEF_TUR']}", "")
-taban = lambda kolonlar: [c for c in kolonlar if c not in TAKVIM_KOL]
-if not np.isclose(sum(CONFIG["AGIRLIK"].values()), 1):
-    raise ValueError("Sıralama ağırlıkları toplamı 1 olmalı.")
-
-display(pd.DataFrame([
-    {"Başlık": "Geliştirme", "Değer": f"{CONFIG['GELISTIRME_ARALIK'][0]}–{CONFIG['GELISTIRME_ARALIK'][1]}"},
-    {"Başlık": "Bağımsız OOT", "Değer": f"{CONFIG['OOT_ARALIK'][0]}–{CONFIG['OOT_ARALIK'][1]}"},
-    {"Başlık": "Bilgi ayı (bugün)", "Değer": CONFIG["BILGI_AYI"]},
-    {"Başlık": "Dış / iç CV", "Değer": f"{CONFIG['N_SPLITS']} × {CONFIG['TEST_SIZE']} ay, bilgi ayına göre "
-                                      f"olgunlaşma boşluklu / {CONFIG['IC_CV_SPLITS']} zamansal fold"},
-    {"Başlık": "Champion / Challenger", "Değer": f"En fazla {CONFIG['CHAMPION_MAX_AY']} / "
-                                                 f"{CONFIG['CHALLENGER_MAX_AY']} aylık öncül"},
-    {"Başlık": "Aday yapısı", "Değer": f"1–{CONFIG['MAX_K']} ham girdi + en fazla {CONFIG['MAX_ORTALAMA']} "
-                                       f"geçmiş ortalama + takvim"},
-    {"Başlık": "Seçim", "Değer": f"HAC p ≤ {CONFIG['HAC_P_ESIK']} + 1-SE + sadelik; trend seçilemez"},
-    {"Başlık": "KKB kolonu", "Değer": KKB_KOL},
-]).style.hide(axis="index"))
+d, HEDEF, ONCULLER, K90 = veri_hazirla(df_raw, CONFIG)
+gel_idx, oot_idx = bolme_uygula(d, CONFIG)
+HK = kisa_ad(HEDEF)
+BILGI = pd.Period(CONFIG["BILGI_AYI"], "M")
+d["BOLGE"] = np.select([d.index.isin(gel_idx), d.index.isin(oot_idx), ~d["HEDEF_KULLANILABILIR"]],
+                       ["GELISTIRME", "OOT", "TAHMIN"], "DISARIDA")
+VERI_OZET = (d.groupby("BOLGE", sort=False)
+              .agg(N=("AY", "size"), BAS=("AY", "min"), SON=("AY", "max"), HEDEF_ORT=(HEDEF, "mean"))
+              .reindex(["GELISTIRME", "OOT", "TAHMIN"]))
+print(f"Hedef: {HEDEF} | Bilgi ayı: {BILGI} | 90+ olgunluk kolonları: {[kisa_ad(k) for k in K90] or 'yok'}")
+display(VERI_OZET.style.format({"HEDEF_ORT": yuzde}, na_rep="-"))
+if not (d["BOLGE"] == "TAHMIN").any():
+    print("UYARI: veri setinde olgunlaşmamış kohort yok -> Bölüm 14'te gelecek tahmini üretilemez. "
+          "Kaynak sorguya 202510 sonrası kohortları ekle (hedef boş/kısmi kalabilir).")
