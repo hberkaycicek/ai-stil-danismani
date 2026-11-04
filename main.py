@@ -1,82 +1,111 @@
-# Ridge / Lasso / ElasticNet: her fold'da tüm alpha yolu TEK seferde çözülür; her alpha ayrı aday olarak
-# AYNI boşluklu walk-forward CV ile ölçülür. Standartlaştırma her fold'un SADECE eğitim kısmıyla yapılır.
-# Çözümler sklearn Ridge / Lasso / ElasticNet(+StandardScaler) ile birebir aynıdır (alt kısımda test).
-def _std(X, y):
-    mx, sx = X.mean(axis=0), X.std(axis=0)
-    sx = np.where(sx > 0, sx, 1.0)
-    return (X - mx) / sx, y - y.mean(), mx, sx, y.mean()
+def kayit_ekle(s, kolonlar, aile, params, satir=None):
+    kolonlar = list(kolonlar)
+    trend = int(TREND_KOL in kolonlar)
+    s.update({"GIRDILER": ", ".join(kisa_ad(c) for c in taban(kolonlar)), "MODEL": aile, "PARAMS": params,
+              "BILGI_AY": bilgi_ayi_hesapla(kolonlar), "TOPLAM_K": len(kolonlar),
+              "TREND": trend, "MEVSIM": int("SIN_AY" in kolonlar),
+              "ORTALAMA": next((f"AGORT{ORTALAMA_PENCERE[c]}" for c in kolonlar if c in ORTALAMA_KOL), "Yok"),
+              "KOLONLAR": tuple(kolonlar),
+              "SECILEBILIR": bool((not trend or CONFIG["TREND_SECILEBILIR"]) and aile in CONFIG["FORMUL_AILELERI"])})
+    return s
 
 
-def alpha_yolu(Xs, yc, aile, alphalar, l1=None):
-    """Standart X, merkezlenmiş y -> (n_alpha x p) katsayı matrisi."""
-    if aile == "Ridge":
-        U, s_, Vt = np.linalg.svd(Xs, full_matrices=False)
-        Uy = U.T @ yc
-        return np.stack([Vt.T @ (s_ / (s_ ** 2 + a) * Uy) for a in alphalar])
-    Xf = np.asfortranarray(Xs)
-    _, coefs, _ = enet_path(Xf, yc, l1_ratio=1.0 if aile == "Lasso" else l1, alphas=alphalar,
-                            max_iter=CONFIG["MAX_ITER"], tol=CONFIG["MODEL_TOL"],
-                            check_input=False, precompute=Xf.T @ Xf, Xy=Xf.T @ yc)
-    return coefs.T
+def rank_ekle(df):
+    g = CONFIG["GECERLI"]
+    df = df.copy()
+    df["GECERLI"] = ((df["CV_WMAPE"] <= g["CV_WMAPE_DUMMY_ORAN"] * DUMMY["CV_WMAPE"])
+                     & (df["EN_KOTU_WMAPE"] <= g["EN_KOTU_DUMMY_ORAN"] * DUMMY["EN_KOTU_WMAPE"])
+                     & (df["OVERFIT_ORANI"] <= g["OVERFIT_ORANI_MAX"])
+                     & (df["MUTLAK_FOLD_SAPMA"] <= g["SAPMA_DUMMY_ORAN"] * DUMMY["MUTLAK_FOLD_SAPMA"])
+                     & (df["ARALIK_DISI"] == 0))
+    df["RANK_SKORU"] = np.nan
+    m = df["GECERLI"]
+    if m.any():
+        skor = 0.0
+        for kol, w in CONFIG["AGIRLIK"].items():
+            s = df.loc[m, kol].astype(float)
+            s = s.clip(lower=1.0) if kol == "OVERFIT_ORANI" else s
+            skor = skor + w * s.rank(pct=True).fillna(1.0)
+        df.loc[m, "RANK_SKORU"] = skor
+    return df.sort_values(["GECERLI", "RANK_SKORU", "CV_WMAPE"], ascending=[False, True, True]).reset_index(drop=True)
 
 
-def yol_varyantlari(aile):
-    if aile == "Ridge":
-        return [(np.asarray(CONFIG["ALPHA_RIDGE"], float), None)]
-    if aile == "Lasso":
-        return [(np.asarray(CONFIG["ALPHA_LASSO"], float), None)]
-    return [(np.asarray(CONFIG["ALPHA_LASSO"], float), l1) for l1 in CONFIG["L1_ORANLARI"]]
+def varyant_etiketi(df):
+    return np.select([(df["TREND"] == 1) & (df["MEVSIM"] == 1), df["TREND"] == 1, df["MEVSIM"] == 1],
+                     ["Trend+Mevsim", "Trend", "Mevsim"], "Yok")
 
 
-def cv_yol(kolonlar, aile, foldlar=None):
-    """Bir aday + bir aile için tüm alpha'ların CV sonuçları: [(params, metrikler), ...]."""
-    X, hazir = fold_hazirla(kolonlar, foldlar)
-    sonuc = []
-    for alphalar, l1 in yol_varyantlari(aile):
-        alphalar = np.sort(alphalar)[::-1]
-        fold_P = []
-        for tr, val in hazir:
-            Xs, yc, mx, sx, my = _std(X[tr], Y_CV[tr])
-            B = alpha_yolu(Xs, yc, aile, alphalar, l1)                 # n_alpha x p
-            fold_P.append((tr, val, ((X[val] - mx) / sx) @ B.T + my, Xs @ B.T + my))
-        for j, a in enumerate(alphalar):
-            kay = [(tr, val, P[:, j], Ptr[:, j]) for tr, val, P, Ptr in fold_P]
-            p = {"alpha": float(a)} if l1 is None else {"alpha": float(a), "l1": float(l1)}
-            sonuc.append((p, metrik_ozet(kay)))
-    return sonuc
+N_JOBS = 2          # paralel çekirdek sayısı (sorun çıkarsa 1 yap)
+GRUP_BOYUTU = 50
 
 
-def model_fabrika(aile, p=None):
-    p = p or {}
-    return {
-        "Dummy":       lambda: DummyRegressor(strategy="mean"),
-        "Linear":      lambda: LinearRegression(),
-        "Ridge":       lambda: Ridge(alpha=p["alpha"]),
-        "Lasso":       lambda: Lasso(alpha=p["alpha"], max_iter=CONFIG["MAX_ITER"], tol=CONFIG["MODEL_TOL"]),
-        "ElasticNet":  lambda: ElasticNet(alpha=p["alpha"], l1_ratio=p["l1"], max_iter=CONFIG["MAX_ITER"],
-                                          tol=CONFIG["MODEL_TOL"]),
-        "Ridge*":      lambda: Ridge(alpha=p["alpha"]),
-        "Lasso*":      lambda: Lasso(alpha=p["alpha"], max_iter=100000),
-        "ElasticNet*": lambda: ElasticNet(alpha=p["alpha"], l1_ratio=p["l1"], max_iter=100000),
-        "Huber":       lambda: HuberRegressor(epsilon=p["eps"], alpha=p["alpha"], max_iter=2000),
-        "SVR":         lambda: SVR(kernel=p["kernel"], C=p["C"], epsilon=p["eps"]),
-        "ExtraTrees":  lambda: ExtraTreesRegressor(n_estimators=300, max_depth=p["depth"],
-                                                   min_samples_leaf=p["leaf"], random_state=42),
-        "GBoost":      lambda: GradientBoostingRegressor(n_estimators=p["n"], learning_rate=p["lr"],
-                                                         max_depth=p["depth"], random_state=42),
-    }[aile]()
+def grup_calistir(grup):
+    warnings.filterwarnings("ignore")                   # paralel işçilerde de uyarıları kapat
+    kayit_, hata_ = [], []
+    for kolonlar in grup:
+        foldlar = fold_al(bilgi_ayi_hesapla(kolonlar))
+        for aile in CONFIG["MODEL_AILELERI"]:
+            try:
+                if aile == "Linear":
+                    kayit_.append(kayit_ekle(cv_degerlendir(kolonlar, model_fabrika(aile), foldlar),
+                                             kolonlar, aile, None))
+                else:                                    # her alpha ayrı satır
+                    for p_, s_ in cv_yol(kolonlar, aile, foldlar):
+                        kayit_.append(kayit_ekle(s_, kolonlar, aile, p_))
+            except Exception as e:
+                hata_.append({"GIRDILER": ", ".join(map(kisa_ad, kolonlar)), "MODEL": aile, "HATA": str(e)[:80]})
+    return kayit_, hata_
 
 
-# Doğrulama: alpha yolu = sklearn (aynı alpha, aynı aday, aynı fold'lar)
-_kol = [ONCULLER[1], KKB_KOL]
-_kontrol = []
-for aile in ["Ridge", "Lasso", "ElasticNet"]:
-    p_, m_yol = cv_yol(_kol, aile)[3]
-    m_sk = cv_degerlendir(_kol, model_fabrika(aile, p_))
-    _kontrol.append({"AILE": aile, "PARAMS": p_, "CV_WMAPE_YOL": m_yol["CV_WMAPE"], "CV_WMAPE_SKLEARN": m_sk["CV_WMAPE"],
-                     "FARK": abs(m_yol["CV_WMAPE"] - m_sk["CV_WMAPE"])})
-display(pd.DataFrame(_kontrol).style.format({"CV_WMAPE_YOL": "{:.6f}", "CV_WMAPE_SKLEARN": "{:.6f}", "FARK": "{:.1e}"}))
-if max(k["FARK"] for k in _kontrol) > 1e-3:
-    raise AssertionError("Alpha yolu sklearn ile uyuşmuyor.")
-print("Alpha ızgarası | Ridge:", np.round(CONFIG["ALPHA_RIDGE"], 4).tolist(),
-      "| Lasso/EN:", [f"{a:.1e}" for a in CONFIG["ALPHA_LASSO"]], "| EN L1:", CONFIG["L1_ORANLARI"])
+for b in range(0, CONFIG["CHAMPION_MAX_AY"] + 1):        # fold'lar önceden hazır olsun (paralel işçiler için)
+    fold_al(b)
+adaylar = list(ADAY_TABLO["KOLONLAR"])
+gruplar = [adaylar[i:i + GRUP_BOYUTU] for i in range(0, len(adaylar), GRUP_BOYUTU)]
+t0, kayit, hatalar = time.time(), [], []
+if N_JOBS > 1:
+    from joblib import Parallel, delayed
+    parca = N_JOBS * 4
+    for i in range(0, len(gruplar), parca):
+        for k_, h_ in Parallel(n_jobs=N_JOBS)(delayed(grup_calistir)(g) for g in gruplar[i:i + parca]):
+            kayit += k_; hatalar += h_
+        print(f"  {min((i + parca) * GRUP_BOYUTU, len(adaylar)):,}/{len(adaylar):,} aday | {time.time() - t0:.0f} sn")
+else:
+    for i, g in enumerate(gruplar, 1):
+        k_, h_ = grup_calistir(g)
+        kayit += k_; hatalar += h_
+        if i % 10 == 0:
+            print(f"  {i * GRUP_BOYUTU:,}/{len(adaylar):,} aday | {time.time() - t0:.0f} sn")
+grid_ham = pd.DataFrame(kayit)
+grid = rank_ekle(grid_ham)
+grid["VARYANT"] = varyant_etiketi(grid)
+print(f"{len(grid):,} değerlendirme | geçerli {int(grid['GECERLI'].sum()):,} | elenen {len(hatalar)} | "
+      f"{(time.time() - t0) / 60:.1f} dk")
+if hatalar:
+    print("Elenme nedenleri:", pd.DataFrame(hatalar)["HATA"].value_counts().to_dict())
+
+GOSTER = ["GIRDILER", "MODEL", "PARAMS", "BILGI_AY", "TOPLAM_K", "TREND", "MEVSIM", "ORTALAMA", "CV_WMAPE",
+          "EN_KOTU_WMAPE", "FOLD_WMAPE_STD", "OVERFIT_ORANI", "DELTA_MAE", "CV_SAPMA", "MUTLAK_FOLD_SAPMA",
+          "YON_AGIRLIKLI", "FOLD1_EGITIM_N", "GECERLI", "SECILEBILIR", "RANK_SKORU"]
+FMT = {**{c: "{:.2f}" for c in ["CV_WMAPE", "EN_KOTU_WMAPE", "FOLD_WMAPE_STD"]},
+       **{c: "{:.4f}" for c in ["OVERFIT_ORANI", "DELTA_MAE", "CV_SAPMA", "MUTLAK_FOLD_SAPMA",
+                                "YON_AGIRLIKLI", "RANK_SKORU"]}}
+print("=== Bileşik skora göre ilk 15 ===")
+display(grid[GOSTER].head(15).style.format(FMT, decimal=","))
+
+
+def grup_ozet(df, by):
+    out = df.groupby(by).agg(VARYANT=("CV_WMAPE", "size"), EN_IYI_CV_WMAPE=("CV_WMAPE", "min"),
+                             MEDYAN_CV_WMAPE=("CV_WMAPE", "median"))
+    out["GECERLI"] = df[df["GECERLI"]].groupby(by).size().reindex(out.index).fillna(0).astype(int)
+    return out[["VARYANT", "GECERLI", "EN_IYI_CV_WMAPE", "MEDYAN_CV_WMAPE"]]
+
+
+OZET_VARYANT = grup_ozet(grid, "VARYANT").reindex(["Yok", "Mevsim", "Trend", "Trend+Mevsim"]).dropna(how="all")
+OZET_BILGI_AY = grup_ozet(grid, "BILGI_AY")
+OZET_AILE = grup_ozet(grid, "MODEL")
+OZET_ORTALAMA = grup_ozet(grid, "ORTALAMA")
+OZET_K = grup_ozet(grid, "TOPLAM_K")
+for ad, t in [("Takvim (trend / mevsim)", OZET_VARYANT), ("Bilgi ayı (en geç öncül)", OZET_BILGI_AY),
+              ("Model ailesi", OZET_AILE), ("Geçmiş ortalama", OZET_ORTALAMA), ("Toplam girdi sayısı", OZET_K)]:
+    print(f"=== {ad} ===")
+    display(t.style.format({"EN_IYI_CV_WMAPE": "{:.2f}", "MEDYAN_CV_WMAPE": "{:.2f}"}, decimal=",", na_rep="-"))
