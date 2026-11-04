@@ -1,28 +1,35 @@
-KATSAYI = []
+p = PERF.set_index(["MODEL", "BOLGE"])
+print("=" * 100)
+print(f"L12M90 ERKEN UYARI MODELİ v8 | hedef {HEDEF} | bilgi ayı {BILGI}")
+print("=" * 100)
+print(f"Veri          : {d['AY'].min()} – {d['AY'].max()} ({len(d)} kohort) | olgun {len(olgun_df)} | tahmin {len(TAHMIN)}")
+for b, r_ in VERI_OZET.dropna(subset=["N"]).iterrows():
+    print(f"  {b:<11}: {r_['BAS']} – {r_['SON']} | N={int(r_['N'])} | hedef ort. {yuzde(r_['HEDEF_ORT'])}")
+print(f"Validasyon    : {VAL_BAS} – {AY_CV.max()} ({CONFIG['N_SPLITS']} fold x {CONFIG['TEST_SIZE']} kohort, "
+      f"olgunlaşma boşluklu walk-forward)")
+print(f"Aday havuzu   : {len(HAM_HAVUZ)} ham + {len(ORTALAMA_KOL)} ortalama | {len(ADAY_TABLO):,} aday | "
+      f"{len(grid):,} değerlendirme | geçerli {int(grid['GECERLI'].sum()):,}")
+print("Takvim        : " + " | ".join(f"{k}: {sayi(v)}" for k, v in OZET_VARYANT["EN_IYI_CV_WMAPE"].items()))
+print("Bilgi ayı     : " + " | ".join(f"{k}. ay: {sayi(v)}" for k, v in OZET_BILGI_AY["EN_IYI_CV_WMAPE"].dropna().items()))
+print("Ortalama      : " + " | ".join(f"{k}: {sayi(v)}" for k, v in OZET_ORTALAMA["EN_IYI_CV_WMAPE"].items()))
+print(f"Naif referans : CV WMAPE {sayi(DUMMY['CV_WMAPE'])}")
 for rol, spec in MODELLER.items():
-    m, kol = URETIM[rol], spec["kolonlar"]
-    reg, sc = m[-1], m[0]
-    if hasattr(reg, "coef_"):
-        coef = np.ravel(reg.coef_) / sc.scale_
-        b0 = float(np.ravel([reg.intercept_])[0] - np.dot(coef, sc.mean_))
-        for k, c in zip(kol, coef):
-            KATSAYI.append({"MODEL": rol, "DEGISKEN": kisa_ad(k), "KATSAYI_HAM": c,
-                            "1_STD_ETKI_yp": c * olgun_df[k].std() * 100})
-        KATSAYI.append({"MODEL": rol, "DEGISKEN": "Sabit", "KATSAYI_HAM": b0, "1_STD_ETKI_yp": np.nan})
-    print(f"{spec['ad']} | N={len(olgun_df.dropna(subset=kol))}\n  {FORMUL.get(rol, 'formül yok')}")
-KATSAYI = pd.DataFrame(KATSAYI)
-display(KATSAYI.style.format({"KATSAYI_HAM": "{:.6g}", "1_STD_ETKI_yp": "{:+.3f}"}, decimal=",", na_rep="-"))
-
+    print("-" * 100)
+    print(spec["ad"])
+    print(f"  Formül      : {FORMUL.get(rol, '-')}")
+    for b in ["VALIDASYON", "OOT"]:
+        q = p.loc[(rol, b)]
+        print(f"  {b:<11}: WMAPE {sayi(q['WMAPE'])} | sapma {q['SAPMA_yp']:+.3f} yp | korelasyon {sayi(q['KORELASYON'], 3)} "
+              f"| yön {q['YON']} | beceri {sayi(q['BECERI'])} (naif {sayi(q['DUMMY_WMAPE'])})")
+    o = OVERLAY[rol]
+    print(f"  Overlay     : {o['deger'] * 100:+.3f} yp | {o['ayni_isaret']}/{o['n']} aynı işaret | "
+          f"{'uygulanıyor' if o['uygula'] else 'uygulanmıyor'}")
 if len(TAHMIN):
-    pct_kol = [c for c in TAHMIN.columns if c.endswith(("_HAM", "_DUZ")) or c == "CHAIN_LADDER"]
-    print(f"=== {HK} TAHMİNLERİ (bilgi ayı {BILGI}) | boş = girdi henüz yok/tamamlanmadı ===")
-    display(TAHMIN.drop(columns="AY").style.format({**{c: "{:.2%}" for c in pct_kol}, "DONEM_1": "{:.0f}"},
-                                                   decimal=",", na_rep="-"))
-else:
-    print("Olgunlaşmamış kohort yok -> tahmin üretilmedi (Bölüm 3 bilgisine bak).")
-
-KAYIT = TAHMIN.drop(columns="AY").copy()
-KAYIT.insert(0, "KAYIT_TARIHI", pd.Timestamp.today().normalize())
-KAYIT.insert(1, "BILGI_AYI", CONFIG["BILGI_AYI"])
-KAYIT.insert(2, "CHAMPION", CHAMP["ad"])
-# KAYIT.to_csv("L12M90_tahmin_kayit.csv", index=False)   # izleme için
+    print("-" * 100)
+    print("Tahminler (champion ham -> overlay | challenger ham -> overlay | chain-ladder):")
+    for _, t in TAHMIN.iterrows():
+        print(f"  {t['DONEM_1']}: {yuzde(t['CHAMPION_HAM'])} -> {yuzde(t['CHAMPION_DUZ'])} | "
+              f"{yuzde(t['CHALLENGER_HAM'])} -> {yuzde(t['CHALLENGER_DUZ'])} | CL {yuzde(t.get('CHAIN_LADDER', np.nan))}")
+print("-" * 100)
+print("Testler:", " | ".join(f"{a}: {b}" for a, b in TESTLER[["TEST", "SONUC"]].values[:5]))
+print("=" * 100)
