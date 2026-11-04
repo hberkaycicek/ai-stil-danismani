@@ -1,111 +1,47 @@
-def kayit_ekle(s, kolonlar, aile, params, satir=None):
-    kolonlar = list(kolonlar)
-    trend = int(TREND_KOL in kolonlar)
-    s.update({"GIRDILER": ", ".join(kisa_ad(c) for c in taban(kolonlar)), "MODEL": aile, "PARAMS": params,
-              "BILGI_AY": bilgi_ayi_hesapla(kolonlar), "TOPLAM_K": len(kolonlar),
-              "TREND": trend, "MEVSIM": int("SIN_AY" in kolonlar),
-              "ORTALAMA": next((f"AGORT{ORTALAMA_PENCERE[c]}" for c in kolonlar if c in ORTALAMA_KOL), "Yok"),
-              "KOLONLAR": tuple(kolonlar),
-              "SECILEBILIR": bool((not trend or CONFIG["TREND_SECILEBILIR"]) and aile in CONFIG["FORMUL_AILELERI"])})
-    return s
+try:
+    import optuna
+except ImportError:
+    optuna = None
+    print("optuna kurulu değil (pip install optuna) -> Bölüm 10 atlanıyor.")
+if CONFIG["OPTUNA_CALISTIR"] and optuna is not None:
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    setler = (grid[grid["GECERLI"] & grid["SECILEBILIR"]].drop_duplicates("KOLONLAR")["KOLONLAR"]
+              .head(CONFIG["OPTUNA_SET_SAYISI"]).tolist())
+    opt_kayit = []
 
+    def amac(trial):
+        kolonlar = list(setler[trial.suggest_int("set", 0, len(setler) - 1)])
+        aile = trial.suggest_categorical("aile", ["Ridge*", "Lasso*", "ElasticNet*", "Huber",
+                                                  "SVR", "ExtraTrees", "GBoost"])
+        p = {}
+        if aile in ("Ridge*", "Huber"):                       # standart X'te ceza
+            p["alpha"] = trial.suggest_float(f"{aile}_alpha", 1e-3, 1e3, log=True)
+        if aile in ("Lasso*", "ElasticNet*"):                 # DÜZELTME: hedef ölçeğinde ceza (alpha_max ~1e-3)
+            p["alpha"] = trial.suggest_float(f"{aile}_alpha", 1e-7, 1e-2, log=True)
+        if aile == "ElasticNet*":
+            p["l1"] = trial.suggest_float("l1", 0.05, 0.95)
+        if aile == "Huber":
+            p["eps"] = trial.suggest_float("h_eps", 1.1, 2.5)
+        if aile == "SVR":
+            p.update(kernel=trial.suggest_categorical("kernel", ["linear", "rbf"]),
+                     C=trial.suggest_float("C", 1e-2, 1e2, log=True),
+                     eps=trial.suggest_float("svr_eps", 1e-5, 1e-3, log=True))
+        if aile == "ExtraTrees":
+            p.update(depth=trial.suggest_int("et_depth", 2, 4), leaf=trial.suggest_int("leaf", 2, 6))
+        if aile == "GBoost":
+            p.update(n=trial.suggest_int("n", 50, 300), lr=trial.suggest_float("lr", 0.01, 0.2, log=True),
+                     depth=trial.suggest_int("gb_depth", 1, 3))
+        s = cv_degerlendir(kolonlar, model_fabrika(aile, p))
+        opt_kayit.append(kayit_ekle(s, kolonlar, aile, p))
+        return s["CV_WMAPE"], (s["DELTA_MAE"] if np.isfinite(s["DELTA_MAE"]) else 1.0)
 
-def rank_ekle(df):
-    g = CONFIG["GECERLI"]
-    df = df.copy()
-    df["GECERLI"] = ((df["CV_WMAPE"] <= g["CV_WMAPE_DUMMY_ORAN"] * DUMMY["CV_WMAPE"])
-                     & (df["EN_KOTU_WMAPE"] <= g["EN_KOTU_DUMMY_ORAN"] * DUMMY["EN_KOTU_WMAPE"])
-                     & (df["OVERFIT_ORANI"] <= g["OVERFIT_ORANI_MAX"])
-                     & (df["MUTLAK_FOLD_SAPMA"] <= g["SAPMA_DUMMY_ORAN"] * DUMMY["MUTLAK_FOLD_SAPMA"])
-                     & (df["ARALIK_DISI"] == 0))
-    df["RANK_SKORU"] = np.nan
-    m = df["GECERLI"]
-    if m.any():
-        skor = 0.0
-        for kol, w in CONFIG["AGIRLIK"].items():
-            s = df.loc[m, kol].astype(float)
-            s = s.clip(lower=1.0) if kol == "OVERFIT_ORANI" else s
-            skor = skor + w * s.rank(pct=True).fillna(1.0)
-        df.loc[m, "RANK_SKORU"] = skor
-    return df.sort_values(["GECERLI", "RANK_SKORU", "CV_WMAPE"], ascending=[False, True, True]).reset_index(drop=True)
-
-
-def varyant_etiketi(df):
-    return np.select([(df["TREND"] == 1) & (df["MEVSIM"] == 1), df["TREND"] == 1, df["MEVSIM"] == 1],
-                     ["Trend+Mevsim", "Trend", "Mevsim"], "Yok")
-
-
-N_JOBS = 2          # paralel çekirdek sayısı (sorun çıkarsa 1 yap)
-GRUP_BOYUTU = 50
-
-
-def grup_calistir(grup):
-    warnings.filterwarnings("ignore")                   # paralel işçilerde de uyarıları kapat
-    kayit_, hata_ = [], []
-    for kolonlar in grup:
-        foldlar = fold_al(bilgi_ayi_hesapla(kolonlar))
-        for aile in CONFIG["MODEL_AILELERI"]:
-            try:
-                if aile == "Linear":
-                    kayit_.append(kayit_ekle(cv_degerlendir(kolonlar, model_fabrika(aile), foldlar),
-                                             kolonlar, aile, None))
-                else:                                    # her alpha ayrı satır
-                    for p_, s_ in cv_yol(kolonlar, aile, foldlar):
-                        kayit_.append(kayit_ekle(s_, kolonlar, aile, p_))
-            except Exception as e:
-                hata_.append({"GIRDILER": ", ".join(map(kisa_ad, kolonlar)), "MODEL": aile, "HATA": str(e)[:80]})
-    return kayit_, hata_
-
-
-for b in range(0, CONFIG["CHAMPION_MAX_AY"] + 1):        # fold'lar önceden hazır olsun (paralel işçiler için)
-    fold_al(b)
-adaylar = list(ADAY_TABLO["KOLONLAR"])
-gruplar = [adaylar[i:i + GRUP_BOYUTU] for i in range(0, len(adaylar), GRUP_BOYUTU)]
-t0, kayit, hatalar = time.time(), [], []
-if N_JOBS > 1:
-    from joblib import Parallel, delayed
-    parca = N_JOBS * 4
-    for i in range(0, len(gruplar), parca):
-        for k_, h_ in Parallel(n_jobs=N_JOBS)(delayed(grup_calistir)(g) for g in gruplar[i:i + parca]):
-            kayit += k_; hatalar += h_
-        print(f"  {min((i + parca) * GRUP_BOYUTU, len(adaylar)):,}/{len(adaylar):,} aday | {time.time() - t0:.0f} sn")
+    study = optuna.create_study(directions=["minimize", "minimize"], sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(amac, n_trials=CONFIG["OPTUNA_TRIALS"])
+    grid = rank_ekle(pd.concat([grid_ham, pd.DataFrame(opt_kayit)], ignore_index=True))
+    grid["VARYANT"] = varyant_etiketi(grid)
+    OZET_AILE = grup_ozet(grid, "MODEL")
+    print(f"Optuna sonrası: {len(grid):,} değerlendirme | geçerli {int(grid['GECERLI'].sum()):,}")
+    display(OZET_AILE.sort_values("EN_IYI_CV_WMAPE").style.format(
+        {"EN_IYI_CV_WMAPE": "{:.2f}", "MEDYAN_CV_WMAPE": "{:.2f}"}, decimal=",", na_rep="-"))
 else:
-    for i, g in enumerate(gruplar, 1):
-        k_, h_ = grup_calistir(g)
-        kayit += k_; hatalar += h_
-        if i % 10 == 0:
-            print(f"  {i * GRUP_BOYUTU:,}/{len(adaylar):,} aday | {time.time() - t0:.0f} sn")
-grid_ham = pd.DataFrame(kayit)
-grid = rank_ekle(grid_ham)
-grid["VARYANT"] = varyant_etiketi(grid)
-print(f"{len(grid):,} değerlendirme | geçerli {int(grid['GECERLI'].sum()):,} | elenen {len(hatalar)} | "
-      f"{(time.time() - t0) / 60:.1f} dk")
-if hatalar:
-    print("Elenme nedenleri:", pd.DataFrame(hatalar)["HATA"].value_counts().to_dict())
-
-GOSTER = ["GIRDILER", "MODEL", "PARAMS", "BILGI_AY", "TOPLAM_K", "TREND", "MEVSIM", "ORTALAMA", "CV_WMAPE",
-          "EN_KOTU_WMAPE", "FOLD_WMAPE_STD", "OVERFIT_ORANI", "DELTA_MAE", "CV_SAPMA", "MUTLAK_FOLD_SAPMA",
-          "YON_AGIRLIKLI", "FOLD1_EGITIM_N", "GECERLI", "SECILEBILIR", "RANK_SKORU"]
-FMT = {**{c: "{:.2f}" for c in ["CV_WMAPE", "EN_KOTU_WMAPE", "FOLD_WMAPE_STD"]},
-       **{c: "{:.4f}" for c in ["OVERFIT_ORANI", "DELTA_MAE", "CV_SAPMA", "MUTLAK_FOLD_SAPMA",
-                                "YON_AGIRLIKLI", "RANK_SKORU"]}}
-print("=== Bileşik skora göre ilk 15 ===")
-display(grid[GOSTER].head(15).style.format(FMT, decimal=","))
-
-
-def grup_ozet(df, by):
-    out = df.groupby(by).agg(VARYANT=("CV_WMAPE", "size"), EN_IYI_CV_WMAPE=("CV_WMAPE", "min"),
-                             MEDYAN_CV_WMAPE=("CV_WMAPE", "median"))
-    out["GECERLI"] = df[df["GECERLI"]].groupby(by).size().reindex(out.index).fillna(0).astype(int)
-    return out[["VARYANT", "GECERLI", "EN_IYI_CV_WMAPE", "MEDYAN_CV_WMAPE"]]
-
-
-OZET_VARYANT = grup_ozet(grid, "VARYANT").reindex(["Yok", "Mevsim", "Trend", "Trend+Mevsim"]).dropna(how="all")
-OZET_BILGI_AY = grup_ozet(grid, "BILGI_AY")
-OZET_AILE = grup_ozet(grid, "MODEL")
-OZET_ORTALAMA = grup_ozet(grid, "ORTALAMA")
-OZET_K = grup_ozet(grid, "TOPLAM_K")
-for ad, t in [("Takvim (trend / mevsim)", OZET_VARYANT), ("Bilgi ayı (en geç öncül)", OZET_BILGI_AY),
-              ("Model ailesi", OZET_AILE), ("Geçmiş ortalama", OZET_ORTALAMA), ("Toplam girdi sayısı", OZET_K)]:
-    print(f"=== {ad} ===")
-    display(t.style.format({"EN_IYI_CV_WMAPE": "{:.2f}", "MEDYAN_CV_WMAPE": "{:.2f}"}, decimal=",", na_rep="-"))
+    print("Optuna atlandı.")
