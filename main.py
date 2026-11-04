@@ -1,50 +1,19 @@
-def ts(p):
-    return p.to_timestamp() if hasattr(p, "to_timestamp") else pd.Period(p, "M").to_timestamp()
+olgun_maske = d["HEDEF_KULLANILABILIR"]
+KAPSAMA = pd.DataFrame([{
+    "DEGISKEN": kisa_ad(c), "GOZLEM_AYI": KOLON_AYI[c],
+    "TUR": "Ortalama" if c in ORTALAMA_KOL else "Takvim" if c in TAKVIM_KOL
+           else "Öncül" if c in ONCULLER else "Başvuru anı",
+    "OLGUN_DOLU": f"{int(d.loc[olgun_maske, c].notna().sum())}/{int(olgun_maske.sum())}",
+    "ILK_DOLU_KOHORT": str(d.loc[d[c].notna(), "AY"].min()),
+    "TAHMIN_DOLU": f"{int(d.loc[d['BOLGE'] == 'TAHMIN', c].notna().sum())}/{int((d['BOLGE'] == 'TAHMIN').sum())}",
+} for c in HAVUZ])
+display(KAPSAMA)
 
-
-def takvim_grafigi(b, tahmin_araligi=None):
-    """Veri bölmesi + bilgi ayı b için walk-forward fold yapısı (taralı alan = olgunlaşma boşluğu)."""
-    def span(p0, p1):
-        a, c = mdates.date2num(ts(p0)), mdates.date2num(ts(p1 + 1))
-        return (a, c - a)
-    foldlar = fold_al(b)
-    val_bas = AY_CV[foldlar[0][1][0]]
-    olgun = d[d["HEDEF_KULLANILABILIR"]]
-    ust = [(span(olgun["AY"].min(), val_bas - 1), ARKA["EGITIM"], "Eğitim"),
-           (span(val_bas, AY_CV.max()), RENK["VALIDASYON"], "Validasyon"),
-           (span(d.loc[oot_idx, "AY"].min(), d.loc[oot_idx, "AY"].max()), RENK["OOT"], "OOT")]
-    gelecek = d.loc[d["BOLGE"] == "TAHMIN", "AY"]
-    if len(gelecek):
-        ust.append((span(gelecek.min(), gelecek.max()), RENK["TAHMIN"], "Tahmin"))
-    satir = [("Kohortlar", ust)]
-    for i, (tr, val) in enumerate(foldlar, 1):
-        parca = [(span(AY_CV[tr[0]], AY_CV[tr[-1]]), "#bfdbfe", None)]
-        if val[0] - tr[-1] > 1:
-            parca.append((span(AY_CV[tr[-1]] + 1, AY_CV[val[0]] - 1), "#e5e7eb", "hatch"))
-        parca.append((span(AY_CV[val[0]], AY_CV[val[-1]]), RENK["VALIDASYON"], None))
-        satir.append((f"CV Fold {i}", parca))
-    fig, ax = plt.subplots(figsize=(16, 4.2))
-    for yy, (ad, parcalar) in enumerate(reversed(satir)):
-        for (x, gen), renk, ek in parcalar:
-            ax.broken_barh([(x, gen)], (yy - 0.35, 0.7), facecolors=renk, edgecolor="white",
-                           hatch="///" if ek == "hatch" else None)
-            if isinstance(ek, str) and ek != "hatch":
-                ax.text(x + gen / 2, yy, ek, ha="center", va="center", fontsize=9, fontweight="bold",
-                        color="white" if renk != ARKA["EGITIM"] else "#334155")
-    ax.set_yticks(range(len(satir))); ax.set_yticklabels([s[0] for s in reversed(satir)])
-    ax.xaxis_date(); ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 7]))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m")); ax.grid(axis="x", alpha=0.3)
-    ax.legend(handles=[Patch(color="#bfdbfe", label="Fold eğitimi"),
-                       Patch(facecolor="#e5e7eb", hatch="///", label="Boşluk: hedef o tarihte henüz belli değil"),
-                       Patch(color=RENK["VALIDASYON"], label="Validasyon"), Patch(color=RENK["OOT"], label="OOT")],
-              loc="upper left", fontsize=8, ncol=4, bbox_to_anchor=(0, -0.12))
-    ax.set_title(f"Walk-forward yapı | bilgi ayı = {b} (öncül {b}. ayda belli, tahmin anı = kohort + {b} ay)",
-                 fontweight="bold", loc="left")
-    plt.tight_layout(); plt.show()
-
-
-for b in [2, 3, 6]:
-    print(f"=== Fold yapısı | bilgi ayı = {b} ===")
-    display(fold_olustur(b)[1])
-takvim_grafigi(2)
-takvim_grafigi(6)
+ilk_dolu = {"Ham": cv_df["AY"].min()}
+for p in CONFIG["ORTALAMA_PENCERELERI"] if CONFIG["ORTALAMA_DENE"] else []:
+    ilk_dolu[f"AGORT{p}"] = cv_df.loc[cv_df[f"{ONCULLER[1]}_AGORT{p}"].notna(), "AY"].min()
+F1 = pd.DataFrame({tur: {b: int((AY_CV[fold_al(b)[0][0]] >= bas).sum()) for b in range(0, CONFIG["CHAMPION_MAX_AY"] + 1)}
+                   for tur, bas in ilk_dolu.items()})
+F1.index.name = "BILGI_AY"
+print(f"Fold 1 eğitim kohort sayısı (MIN_TRAIN = {MIN_TRAIN}; altı kalan aday elenir):")
+display(F1.style.apply(lambda s: ["background-color:#fee2e2" if v < MIN_TRAIN else "" for v in s]))
