@@ -1,76 +1,49 @@
-# DÜZELTME: her olgun kohort (validasyon ve OOT), KENDİ tahmin anında (AY + bilgi ayı) hedefi belli olan
-# kohortlarla yeniden eğitilen modelle tahmin edilir. Tek fit yok.
-olgun_df = d[d["HEDEF_KULLANILABILIR"]].copy()
+from statsmodels.stats.stattools import durbin_watson, jarque_bera
+from statsmodels.stats.diagnostic import acorr_ljungbox, het_breuschpagan, linear_reset
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
+kol = CHAMP["kolonlar"]
+t_df = olgun_df.dropna(subset=kol)
+Xc = sm.add_constant(t_df[kol].astype(float).to_numpy(), has_constant="add")
+yv = t_df[HEDEF].astype(float).to_numpy()
+ols = sm.OLS(yv, Xc).fit()
+m_ch = pipe_fit(model_fabrika(CHAMP["aile"], CHAMP["params"]), t_df[kol], t_df[HEDEF])   # 14'ten bağımsız
+resid = m_ch.predict(t_df[kol]) - yv
+rho = float(np.corrcoef(resid[:-1], resid[1:])[0, 1])
+jb = jarque_bera(resid)
+p_gel, p_tum = hac_p(kol, cv_df), hac_p(kol, olgun_df)
+TESTLER = pd.DataFrame([
+    {"TEST": "HAC p (geliştirme, seçimde kullanılan)", "SONUC": ", ".join(f"{kisa_ad(k)}={p:.3f}" for k, p in zip(kol, p_gel)),
+     "YORUM": f"<= {CONFIG['HAC_P_ESIK']} anlamlı"},
+    {"TEST": "HAC p (tüm olgun veri, OOT dahil)", "SONUC": ", ".join(f"{kisa_ad(k)}={p:.3f}" for k, p in zip(kol, p_tum)),
+     "YORUM": "anlamlılık OOT eklenince korunuyor mu?"},
+    {"TEST": "R² / Düzeltilmiş R² (tüm olgun veri)", "SONUC": f"{ols.rsquared:.3f} / {ols.rsquared_adj:.3f}", "YORUM": "in-sample"},
+    {"TEST": "Durbin-Watson", "SONUC": f"{durbin_watson(resid):.3f}", "YORUM": "2 = otokorelasyon yok"},
+    {"TEST": "Efektif gözlem", "SONUC": f"{len(yv) * (1 - rho) / (1 + rho):.1f} / {len(yv)}", "YORUM": f"lag-1 rho {rho:.2f}"},
+    {"TEST": "Ljung-Box p (lag 1/3/6)", "SONUC": " / ".join(f"{p:.3f}" for p in acorr_ljungbox(resid, lags=[1, 3, 6])["lb_pvalue"]),
+     "YORUM": "<0,05 otokorelasyon"},
+    {"TEST": "Breusch-Pagan p", "SONUC": f"{het_breuschpagan(resid, Xc)[1]:.3f}", "YORUM": ">0,05 sabit varyans"},
+    {"TEST": "Jarque-Bera p", "SONUC": f"{jb[1]:.3f} (çarp. {jb[2]:.2f}, bas. {jb[3]:.2f})", "YORUM": ">0,05 normal"},
+    {"TEST": "Ramsey RESET p", "SONUC": f"{linear_reset(ols, power=2, use_f=True).pvalue:.3f}", "YORUM": ">0,05 doğrusal form yeterli"},
+    {"TEST": "VIF", "SONUC": ", ".join(f"{kisa_ad(k)}={variance_inflation_factor(Xc, i + 1):.2f}" for i, k in enumerate(kol))
+     if len(kol) > 1 else "-", "YORUM": "<5 iyi, >10 sorunlu"},
+])
+print(f"=== {CHAMP['ad']} | istatistiksel testler ===")
+display(TESTLER)
 
-def wf_tahmin(spec):
-    kol, kayit = spec["kolonlar"], []
-    for i in olgun_df.index:
-        c = olgun_df.loc[i]
-        tahmin_ay = tahmin_ayi_hesapla(c["AY"], spec["bilgi_ay"])
-        eg = olgun_df[olgun_df["HEDEF_ERISIM"] < tahmin_ay].dropna(subset=kol)
-        if len(eg) < MIN_TRAIN or c[kol].isna().any():
-            continue
-        m = pipe_fit(model_fabrika(spec["aile"], spec["params"]), eg[kol], eg[HEDEF], agirlik_al(eg))
-        kayit.append({"DONEM_1": int(c["DONEM_1"]), "AY": c["AY"], "BOLGE": c["BOLGE"], "TAHMIN_AY": tahmin_ay,
-                      "HEDEF_ERISIM": c["HEDEF_ERISIM"], "GERCEK": float(c[HEDEF]),
-                      "TAHMIN": float(m.predict(olgun_df.loc[[i], kol])[0]),
-                      "DUMMY": float(eg[HEDEF].mean()), "EGITIM_N": len(eg), "EGITIM_SON": str(eg["AY"].max())})
-    w = pd.DataFrame(kayit)
-    w["ARTIK"] = w["TAHMIN"] - w["GERCEK"]
-    return w
+drift_kol = list(dict.fromkeys([c for s_ in MODELLER.values() for c in taban(s_["kolonlar"])] + [HEDEF]))
+DRIFT = pd.DataFrame([{"DEGISKEN": kisa_ad(c), "GEL_ORT": d.loc[gel_idx, c].mean(), "OOT_ORT": d.loc[oot_idx, c].mean(),
+                       "DEGISIM_%": (d.loc[oot_idx, c].mean() / d.loc[gel_idx, c].mean() - 1) * 100,
+                       "DRIFT_Z": (d.loc[oot_idx, c].mean() - d.loc[gel_idx, c].mean()) / d.loc[gel_idx, c].std()}
+                      for c in drift_kol])
+print("=== Girdi / hedef kayması (geliştirme -> OOT) ===")
+display(DRIFT.style.format({"GEL_ORT": "{:.4f}", "OOT_ORT": "{:.4f}", "DEGISIM_%": "{:+.1f}", "DRIFT_Z": "{:+.2f}"}, decimal=","))
 
-
-def metrik(g, p):
-    g, p = np.asarray(g, float), np.asarray(p, float)
-    if len(g) < 3:
-        return {}
-    dg, dp = np.diff(g), np.diff(p)
-    return {"N": len(g), "WMAPE": wmape(g, p), "MAE_yp": float(np.mean(np.abs(p - g)) * 100),
-            "RMSE_yp": float(np.sqrt(np.mean((p - g) ** 2)) * 100), "SAPMA_yp": float(np.mean(p - g) * 100),
-            "R2": float(1 - np.sum((g - p) ** 2) / np.sum((g - g.mean()) ** 2)),
-            "KORELASYON": float(np.corrcoef(g, p)[0, 1]) if np.std(p) > 0 else np.nan,
-            "YON": f"{int((np.sign(dg) == np.sign(dp)).sum())}/{len(dg)}",
-            "POZITIF_SAPMA": f"{int((p > g).sum())}/{len(g)}"}
-
-
-VAL_BAS = AY_CV[fold_al(0)[0][1][0]]
-WF, OVERLAY, PERF, SIZINTI = {}, {}, [], []
-for rol, spec in MODELLER.items():
-    w = wf_tahmin(spec)
-    WF[rol] = w
-    for bolge, maske in [("VALIDASYON", (w["BOLGE"] == "GELISTIRME") & (w["AY"] >= VAL_BAS)),
-                         ("OOT", w["BOLGE"] == "OOT")]:
-        s = w[maske]
-        mm, dm = metrik(s["GERCEK"], s["TAHMIN"]), metrik(s["GERCEK"], s["DUMMY"])
-        PERF.append({"MODEL": rol, "BOLGE": bolge, **mm, "DUMMY_WMAPE": dm["WMAPE"],
-                     "BECERI": 1 - mm["WMAPE"] / dm["WMAPE"]})
-    o1 = w[w["BOLGE"] == "OOT"].iloc[0]
-    SIZINTI.append({"MODEL": rol, "BILGI_AY": spec["bilgi_ay"], "ILK_OOT_KOHORT": str(o1["AY"]),
-                    "TAHMIN_ANI": str(o1["TAHMIN_AY"]), "EGITIM_SON_KOHORT": o1["EGITIM_SON"],
-                    "EGITIM_N": o1["EGITIM_N"]})
-    son = w[w["HEDEF_ERISIM"] < BILGI].sort_values("HEDEF_ERISIM").tail(CONFIG["OVERLAY_PENCERE"])
-    ayni = int(max((son["ARTIK"] > 0).sum(), (son["ARTIK"] < 0).sum()))
-    OVERLAY[rol] = {"deger": float(son["ARTIK"].mean()), "ayni_isaret": ayni, "n": len(son),
-                    "donem": f"{son['DONEM_1'].min()}-{son['DONEM_1'].max()}",
-                    "uygula": ayni >= CONFIG["OVERLAY_MIN_AYNI_ISARET"]}
-
-PERF = pd.DataFrame(PERF)
-SIZINTI = pd.DataFrame(SIZINTI)
-SIZINTI["KONTROL"] = np.where([pd.Period(e, "M") + 12 + CONFIG["RAPOR_GECIKME_AY"] < pd.Period(t, "M")
-                               for e, t in zip(SIZINTI["EGITIM_SON_KOHORT"], SIZINTI["TAHMIN_ANI"])], "OK", "SIZINTI")
-print("Sızıntı kontrolü (eğitimin son kohortu + 12 < tahmin anı olmalı):")
-display(SIZINTI)
-print(f"Validasyon: {VAL_BAS} – {AY_CV.max()} | OOT: {d.loc[oot_idx, 'AY'].min()} – {d.loc[oot_idx, 'AY'].max()}")
-display(PERF.style.format({"WMAPE": "{:.2f}", "MAE_yp": "{:.3f}", "RMSE_yp": "{:.3f}", "SAPMA_yp": "{:+.3f}",
-                           "R2": "{:.3f}", "KORELASYON": "{:.3f}", "DUMMY_WMAPE": "{:.2f}", "BECERI": "{:.3f}"},
-                          decimal=","))
-for rol, o in OVERLAY.items():
-    print(f"{rol}: overlay {o['deger'] * 100:+.3f} yp | son {o['n']} olgun kohortun {o['ayni_isaret']}'i aynı "
-          f"işaret ({o['donem']}) -> {'UYGULANIR' if o['uygula'] else 'uygulanmaz'}")
-_p = PERF.set_index(["MODEL", "BOLGE"])
-print("\nÖZET (rakamlar bu çalıştırmadan, elle yazılmaz):")
-for rol in MODELLER:
-    v, o = _p.loc[(rol, "VALIDASYON")], _p.loc[(rol, "OOT")]
-    print(f"  {rol}: validasyon WMAPE {sayi(v['WMAPE'])} | OOT WMAPE {sayi(o['WMAPE'])} "
-          f"(naif {sayi(o['DUMMY_WMAPE'])}, beceri {sayi(o['BECERI'])}) | OOT sapma {o['SAPMA_yp']:+.3f} yp")
+oran_onc = [c for c in drift_kol if c in ONCULLER]
+r = olgun_df.assign(DONEM=olgun_df["AY"].dt.year.astype(str) + "-H" + ((olgun_df["AY"].dt.month > 6) + 1).astype(str))
+DONUSUM = r.groupby("DONEM").agg(N=(HEDEF, "size"), HEDEF_ORT=(HEDEF, "mean"), **{f"ORT_{kisa_ad(c)}": (c, "mean") for c in oran_onc})
+for c in oran_onc:
+    DONUSUM[f"HEDEF/{kisa_ad(c)}"] = DONUSUM["HEDEF_ORT"] / DONUSUM[f"ORT_{kisa_ad(c)}"]
+print("=== Erken gecikmenin batığa dönüşüm oranı (yarıyıl) ===")
+display(DONUSUM.style.format({c: ("{:.2%}" if c.startswith(("HEDEF_ORT", "ORT_")) else "{:.2f}")
+                              for c in DONUSUM.columns if c != "N"}, decimal=","))
