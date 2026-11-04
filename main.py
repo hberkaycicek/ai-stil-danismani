@@ -1,89 +1,97 @@
-def veri_hazirla(df_raw, config):
-    tur = config["HEDEF_TUR"]
-    hedef = oncul_kolon(config["HEDEF_SON"], tur)
-    onculler = [oncul_kolon(k, tur) for k in ONCU_KODLARI]
-    k90 = sorted([c for c in df_raw.columns if c.startswith("KK_TAKIP_90_") and c.endswith(f"_{tur}")
-                  and c.split("_")[3].isdigit() and int(c.split("_")[3]) < 12],
-                 key=lambda c: int(c.split("_")[3]))
-    ham_ortak = [c for c in ORTAK_ALANLAR if c != "ORTALAMA_LIMIT"]
-    ek = [config[k] for k in ["LIMIT_KOLON", "LIMIT_PAYDA_KOLON", "ORTALAMA_AGIRLIK_KOLON",
-                              "SAMPLE_WEIGHT_KOLON", "TUFE_KOLON"] if config[k]]
-    gerekli = list(dict.fromkeys(["DONEM_1", hedef, *onculler, *ham_ortak, *ek, *k90]))
-    eksik = sorted(set(gerekli) - set(df_raw.columns))
-    if eksik:
-        raise ValueError(f"Eksik kolon: {eksik}")
-    if any("_90_" in k for k in onculler + ORTAK_ALANLAR):
-        raise ValueError("90+ alanı girdi olamaz.")
-
-    d = df_raw[gerekli].copy()
-    d["AY"] = pd.to_datetime(d["DONEM_1"].astype(str), format="%Y%m").dt.to_period("M")
-    d = d.sort_values("AY").reset_index(drop=True)
-    if d["AY"].duplicated().any():
-        raise ValueError("Tekrarlanan kohort var.")
-    tam = pd.period_range(d["AY"].min(), d["AY"].max(), freq="M")
-    if len(tam) != len(d):
-        raise ValueError(f"Eksik ay: {sorted(set(tam.astype(str)) - set(d['AY'].astype(str)))}")
-    sayisal = [c for c in gerekli if c != "DONEM_1"]
-    d[sayisal] = d[sayisal].apply(pd.to_numeric, errors="raise")
-
-    payda = d[config["LIMIT_PAYDA_KOLON"]].where(d[config["LIMIT_PAYDA_KOLON"]] > 0)
-    d["ORTALAMA_LIMIT"] = d[config["LIMIT_KOLON"]] / payda
-    if config["TUFE_KOLON"]:
-        d["ORTALAMA_LIMIT"] = d["ORTALAMA_LIMIT"] / d[config["TUFE_KOLON"]] * 100
-
-    orijin = pd.Period(config["TREND_ORIJIN"], freq="M")
-    d[TREND_KOL] = d["AY"].apply(lambda p: (p - orijin).n).astype(float)
-    d["SIN_AY"] = np.sin(2 * np.pi * d["AY"].dt.month / 12)
-    d["COS_AY"] = np.cos(2 * np.pi * d["AY"].dt.month / 12)
-
-    bilgi = pd.Period(config["BILGI_AYI"], freq="M")
-    gec = config["RAPOR_GECIKME_AY"]
-    d["HEDEF_ERISIM"] = d["AY"] + config["HEDEF_OLGUNLASMA_AY"] + gec       # hedefin belli olduğu ay
-    gecerli_hedef = d[hedef].notna() & np.isfinite(d[hedef]) & d[hedef].between(0, 1)
-    d["HEDEF_KULLANILABILIR"] = (d["HEDEF_ERISIM"] < bilgi) & gecerli_hedef
-    d["GOZLENEN_AY"] = d["AY"].apply(lambda p: (bilgi - p).n) - 1 - gec
-
-    kismi = {}
-    for k, kol in zip(ONCU_KODLARI, onculler):                               # bugün tamamlanmamış öncül -> NaN
-        tam_mi = (d["AY"] + oncul_ay(k) + gec) < bilgi
-        if (~tam_mi & d[kol].notna()).any():
-            kismi[kisa_ad(kol)] = int((~tam_mi & d[kol].notna()).sum())
-        d.loc[~tam_mi, kol] = np.nan
-    if kismi:
-        print("Kısmi (tamamlanmamış) öncül değeri NaN yapıldı:", kismi)
-    if ((d[onculler] < 0) | (d[onculler] > 1)).sum().sum():
-        raise ValueError("0-1 dışında oran girdisi var.")
-    na = d.loc[d["HEDEF_KULLANILABILIR"], onculler + ORTAK_ALANLAR].isna().sum()
-    if na.any():
-        print("UYARI - olgun kohortlarda boş girdi:\n", na[na > 0].to_string())
-    return d, hedef, onculler, k90
+# Kural: kohort c'nin her girdisi, c'nin tahmin anında sistemde olan veriyle üretilir.
+#   - X_Y öncülü, kohort j için ancak j + Y < T ise bilinir (T = verinin geldiği ay)
+#   - Ortalama: sadece ÖNCEKİ kohortlar (shift(1)), limit ağırlıklı, tam pencere. Lead YASAK.
+HAM_HAVUZ = ONCULLER + ORTAK_ALANLAR
+KOLON_AYI = {c: 0 for c in ORTAK_ALANLAR + TAKVIM_KOL}
+KOLON_AYI.update({oncul_kolon(k): oncul_ay(k) for k in ONCU_KODLARI})
 
 
-def bolme_uygula(d, config):
-    kullan = d[d["HEDEF_KULLANILABILIR"]]
-    gel = kullan.index[kullan["DONEM_1"].between(*config["GELISTIRME_ARALIK"])].to_numpy()
-    oot = kullan.index[kullan["DONEM_1"].between(*config["OOT_ARALIK"])].to_numpy()
-    disarida = kullan.index.difference(np.concatenate([gel, oot]))
-    if len(disarida):
-        print("UYARI - bölgeye atanmamış olgun kohort:", list(kullan.loc[disarida, "DONEM_1"]))
-    if len(gel) == 0 or len(oot) == 0 or len(set(gel) & set(oot)):
-        raise ValueError("Geliştirme/OOT bölmesi hatalı.")
-    if d.loc[gel, "AY"].max() >= d.loc[oot, "AY"].min():
-        raise ValueError("OOT geliştirmeden sonra başlamalı.")
-    return gel, oot
+def ortalama_uret(df, T):
+    """T ayının başında bilinen veriyle geçmiş kohort ortalamaları. Dönüş: DataFrame."""
+    x = df.sort_values("AY").copy()
+    for k in ONCU_KODLARI:                                                   # T'de tamamlanmamış öncül -> NaN
+        x.loc[x["AY"] + oncul_ay(k) + CONFIG["RAPOR_GECIKME_AY"] >= T, oncul_kolon(k)] = np.nan
+    w = x[CONFIG["ORTALAMA_AGIRLIK_KOLON"]].astype(float)
+    g = CONFIG["ORTALAMA_GECIKME"]
+    out = {}
+    for kol in HAM_HAVUZ:
+        s = x[kol].astype(float)
+        ws = w.where(s.notna())                                              # boş değerin ağırlığı da sayılmaz
+        for p in CONFIG["ORTALAMA_PENCERELERI"]:
+            mp = p if CONFIG["ORTALAMA_TAM_PENCERE"] else 1
+            pay = (s * ws).shift(g).rolling(p, min_periods=mp).sum()
+            payda = ws.shift(g).rolling(p, min_periods=mp).sum()
+            out[f"{kol}_AGORT{p}"] = pay / payda.where(payda > 0)
+    return pd.DataFrame(out, index=x.index)
 
 
-d, HEDEF, ONCULLER, K90 = veri_hazirla(df_raw, CONFIG)
-gel_idx, oot_idx = bolme_uygula(d, CONFIG)
-HK = kisa_ad(HEDEF)
-BILGI = pd.Period(CONFIG["BILGI_AYI"], "M")
-d["BOLGE"] = np.select([d.index.isin(gel_idx), d.index.isin(oot_idx), ~d["HEDEF_KULLANILABILIR"]],
-                       ["GELISTIRME", "OOT", "TAHMIN"], "DISARIDA")
-VERI_OZET = (d.groupby("BOLGE", sort=False)
-              .agg(N=("AY", "size"), BAS=("AY", "min"), SON=("AY", "max"), HEDEF_ORT=(HEDEF, "mean"))
-              .reindex(["GELISTIRME", "OOT", "TAHMIN"]))
-print(f"Hedef: {HEDEF} | Bilgi ayı: {BILGI} | 90+ olgunluk kolonları: {[kisa_ad(k) for k in K90] or 'yok'}")
-display(VERI_OZET.style.format({"HEDEF_ORT": yuzde}, na_rep="-"))
-if not (d["BOLGE"] == "TAHMIN").any():
-    print("Bilgi: veride olgunlaşmamış kohort yok -> Bölüm 15-16'da gelecek tahmini üretilmez. "
-          "Gelecek tahmini için 202510 sonrası kohortları veriye ekle (hedef boş/kısmi kalabilir).")
+ORTALAMA_KOL, ORTALAMA_KAYNAK, ORTALAMA_PENCERE = [], {}, {}
+if CONFIG["ORTALAMA_DENE"]:
+    g_, pencereler = CONFIG["ORTALAMA_GECIKME"], CONFIG["ORTALAMA_PENCERELERI"]
+    if not isinstance(g_, int) or g_ < 1:
+        raise ValueError("Ortalama gecikmesi pozitif tam sayı olmalı (shift(0) kohortun kendisini içerir).")
+    ORT_DF = ortalama_uret(d, BILGI)
+    d = d.drop(columns=[c for c in ORT_DF.columns if c in d.columns]).join(ORT_DF)
+    for kol in HAM_HAVUZ:
+        for p in pencereler:
+            ad = f"{kol}_AGORT{p}"
+            ORTALAMA_KOL.append(ad)
+            ORTALAMA_KAYNAK[ad], ORTALAMA_PENCERE[ad] = kol, p
+            KOLON_AYI[ad] = KOLON_AYI[kol]
+
+    # Point-in-time testi: her kohort için ortalamayı, gelecek satırlar silinmiş veriyle ve kendi
+    # tahmin anında yeniden üret; pipeline'daki değerle aynı değilse sızıntı vardır.
+    pit = []
+    for i in d.index:
+        c_ay = d.loc[i, "AY"]
+        gecmis = d[d["AY"] <= c_ay]
+        for Y in sorted({KOLON_AYI[a] for a in ORTALAMA_KOL}):
+            yeniden = ortalama_uret(gecmis, tahmin_ayi_hesapla(c_ay, Y))      # Y. ay verisinin geldiği ay
+            for a in [a for a in ORTALAMA_KOL if KOLON_AYI[a] == Y]:
+                v1, v2 = d.loc[i, a], yeniden.loc[i, a]
+                if not ((pd.isna(v1) and pd.isna(v2)) or (pd.notna(v1) and pd.notna(v2) and np.isclose(v1, v2))):
+                    pit.append({"KOHORT": str(c_ay), "DEGISKEN": kisa_ad(a), "PIPELINE": v1, "O_GUN": v2})
+    print(f"Point-in-time testi: {len(pit)} uyumsuzluk", "-> sızıntı yok" if not pit else "-> KONTROL ET")
+    if pit:
+        display(pd.DataFrame(pit).head(20))
+
+HAVUZ = HAM_HAVUZ + ORTALAMA_KOL + TAKVIM_KOL
+if len(HAVUZ) != len(set(HAVUZ)) or any("_90_" in c or c == HEDEF for c in HAVUZ):
+    raise ValueError("Tekrarlanan veya yasak model girdisi var.")
+bilgi_ayi_hesapla = lambda kolonlar: max((KOLON_AYI[c] for c in kolonlar), default=0)
+
+
+def kombinasyon_uygun(kolonlar):
+    aylar = [KOLON_AYI[c] for c in kolonlar if c in ONCULLER]
+    return not CONFIG["AYNI_AYDAN_TEK_ONCUL"] or len(aylar) == len(set(aylar))
+
+
+TEMEL_KOMBS = [alt for adet in range(1, CONFIG["MAX_K"] + 1)
+               for alt in combinations(HAM_HAVUZ, adet) if kombinasyon_uygun(alt)]
+VARYANTLAR = [trend + mevsim
+              for trend in ([(), (TREND_KOL,)] if CONFIG["TREND_DENE"] else [()])
+              for mevsim in ([(), tuple(MEVSIM_KOL)] if CONFIG["MEVSIM_DENE"] else [()])]
+
+
+def ortalama_ekleri(temel):
+    uygun = [k for k in ORTALAMA_KOL if ORTALAMA_KAYNAK[k] in temel]       # sadece modeldeki girdinin ortalaması
+    return [()] + [(k,) for k in uygun]
+
+
+KOMBS = [temel + ort + takvim
+         for temel in TEMEL_KOMBS for ort in ortalama_ekleri(temel) for takvim in VARYANTLAR
+         if bilgi_ayi_hesapla(temel + ort) <= CONFIG["CHAMPION_MAX_AY"]]
+ADAY_TABLO = pd.DataFrame([{
+    "ADAY_ID": n, "GIRDILER": ", ".join(map(kisa_ad, taban(k))),
+    "TEMEL_K": sum(c in HAM_HAVUZ for c in k), "ORTALAMA_K": sum(c in ORTALAMA_KOL for c in k),
+    "TOPLAM_K": len(k), "BILGI_AY": bilgi_ayi_hesapla(k),
+    "TREND": int(TREND_KOL in k), "MEVSIM": int("SIN_AY" in k),
+    "ORTALAMA": next((f"AGORT{ORTALAMA_PENCERE[c]}" for c in k if c in ORTALAMA_KOL), "Yok"),
+    "SECILEBILIR": TREND_KOL not in k or CONFIG["TREND_SECILEBILIR"],
+    "CHALLENGER": bilgi_ayi_hesapla(k) <= CONFIG["CHALLENGER_MAX_AY"],
+    "KOLONLAR": tuple(k)} for n, k in enumerate(KOMBS, 1)])
+print(f"Havuz: {len(HAM_HAVUZ)} ham + {len(ORTALAMA_KOL)} ortalama + takvim | aday: {len(ADAY_TABLO):,}")
+display(pd.DataFrame([{"Model": "CHAMPION", "Aday": len(ADAY_TABLO)},
+                      {"Model": "CHALLENGER", "Aday": int(ADAY_TABLO["CHALLENGER"].sum())}])
+        .style.hide(axis="index").format({"Aday": "{:,.0f}"}))
+print("Bilgi ayı dağılımı:", ADAY_TABLO["BILGI_AY"].value_counts().sort_index().to_dict())
