@@ -1,124 +1,170 @@
-# Bölüm 1–14'e DOKUNMAZ: model, seçim ve OOT aynı kalır. Yeni kohortlar ayrı bir tabloya (d_tum) eklenir,
-# öncül/ortalama kuralları (Bölüm 3–4) aynen uygulanır, final modeller tüm olgun veriyle kurulup tahmin yapılır.
-# Oranlar YÜZDE yazılır, kod /100 yapar. Bilgi ayında tamamlanmamış öncüller otomatik NaN yapılır.
-# Kaynak (2026-11-05): BDS Vintage raporu, ADETSEL_xMyy kolonları. Başvuru metrikleri tutarsal ile aynı.
-# 202609 / 202610 alınmadı: hiçbir öncül tamamlanmadı.
-YENI_DONEMLER = [202510, 202511, 202512, 202601, 202602, 202603, 202604, 202605, 202606, 202607, 202608]
-YENI_BASVURU = {   # DONEM: (ADET, LIMIT, KKB, MM_SKOR %, KALIBRE_PD %) – tutarsal ile aynı
-    202510: (147970, 7200471490, 1370.24, 10.31, 1.83),
-    202511: (140430, 7196514711, 1373.49, 10.28, 1.79),
-    202512: (160275, 9033999394, 1371.84, 10.28, 1.75),
-    202601: (156526, 9542190375, 1382.34, 9.97, 1.66),
-    202602: (150351, 9251086456, 1399.88, 9.44, 1.61),
-    202603: (174853, 10965123843, 1415.94, 9.05, 1.57),
-    202604: (164257, 9933086144, 1407.02, 9.29, 1.62),
-    202605: (137114, 7746839735, 1380.53, 9.94, 1.70),
-    202606: (158690, 9144006550, 1367.22, 10.27, 1.82),
-    202607: (156361, 9701897450, 1351.88, 10.92, 2.22),
-    202608: (137122, 8437839300, 1350.78, 11.03, 2.13),
-}
-# ADETSEL öncüller (%), YENI_DONEMLER sırasıyla (rapordaki değerler; kısmi olanları Bölüm 3 kuralı eler)
-YENI_ONCUL = {
-    "20_2": [2.81, 2.91, 2.75, 2.52, 2.36, 2.38, 2.68, 2.65, 2.90, 3.40, 3.55],   # ADETSEL_2M20
-    "30_3": [3.39, 3.33, 2.86, 3.03, 2.85, 2.97, 3.24, 3.29, 3.45, 4.10, 2.75],   # ADETSEL_3M30
-    "60_3": [0.50, 0.49, 0.47, 0.47, 0.47, 0.43, 0.45, 0.45, 0.49, 0.62, 0.16],   # ADETSEL_3M60
-    "30_4": [5.26, 4.65, 4.51, 4.91, 4.66, 4.88, 5.22, 5.38, 5.55, 5.23, 2.75],   # ADETSEL_4M30
-    "60_4": [1.37, 1.26, 1.25, 1.31, 1.21, 1.25, 1.28, 1.30, 1.35, 1.12, 0.16],   # ADETSEL_4M60
-    "30_5": [6.47, 6.07, 6.17, 6.86, 6.46, 6.62, 6.96, 7.37, 6.47, 5.23, 2.75],   # ADETSEL_5M30
-    "60_5": [1.92, 1.77, 1.89, 2.01, 1.82, 1.83, 1.91, 1.99, 1.64, 1.12, 0.16],   # ADETSEL_5M60
-    "30_6": [7.77, 7.46, 8.03, 8.60, 7.99, 8.13, 8.53, 8.28, 6.47, 5.23, 2.75],   # ADETSEL_6M30
-    "60_6": [2.41, 2.39, 2.60, 2.75, 2.47, 2.41, 2.52, 2.30, 1.64, 1.12, 0.16],   # ADETSEL_6M60
-    "30_2": None,   # DOLDUR: ADETSEL_2M30 – raporda görünmedi
-}
-# ADETSEL 90+ olgunlaşma kolonları (chain-ladder, GİRDİ DEĞİL), YENI_DONEMLER sırasıyla.
-# Oran hesabı için olgun kohortlarda da (df_raw_adetsel.csv) KK_TAKIP_90_4/5/6_ADETSEL kolonları olmalı.
-K90_YENI = {
-    "90_4": [0.30, 0.27, 0.28, 0.30, 0.31, 0.26, 0.27, 0.27, 0.30, 0.07, 0.00],   # ADETSEL_4M90
-    "90_5": [0.75, 0.72, 0.76, 0.83, 0.73, 0.74, 0.76, 0.80, 0.52, 0.07, 0.00],   # ADETSEL_5M90
-    "90_6": [1.04, 1.00, 1.12, 1.17, 1.03, 1.05, 1.09, 0.96, 0.52, 0.07, 0.00],   # ADETSEL_6M90
-}
+def tahmin_tablosu():
+    """Sunum için: olgunlaşmamış kohortların tahmin tablosu (görsel)."""
+    if not len(TAHMIN):
+        print("Olgunlaşmamış kohort yok -> tahmin tablosu yok.")
+        return
+    kolonlar = [("DONEM_1", "Kohort"), ("GOZLENEN_AY", "Gözlenen ay")]
+    for rol in MODELLER:
+        kolonlar += [(f"{rol}_HAM", f"{rol.title()} ham"), (f"{rol}_DUZ", f"{rol.title()} overlay")]
+    if "CHAIN_LADDER" in TAHMIN:
+        kolonlar += [("CHAIN_LADDER", "Chain-ladder"), ("CL_KAYNAK", "CL kaynak")]
+    hucre = []
+    for _, r in TAHMIN.iterrows():
+        satir = []
+        for k, _a in kolonlar:
+            v = r[k]
+            satir.append(str(int(v)) if k in ("DONEM_1", "GOZLENEN_AY") else
+                         (v if isinstance(v, str) else "-") if k == "CL_KAYNAK" else yuzde(v))
+        hucre.append(satir)
+    fig, ax = plt.subplots(figsize=(16, 0.42 * len(hucre) + 1.4)); ax.axis("off")
+    tbl = ax.table(cellText=hucre, colLabels=[a for _, a in kolonlar], cellLoc="center", loc="center")
+    tbl.auto_set_font_size(False); tbl.set_fontsize(10); tbl.scale(1, 1.5)
+    for (i, j), c in tbl.get_celld().items():
+        c.set_edgecolor("#e5e7eb")
+        if i == 0:
+            c.set_facecolor("#1f2937"); c.set_text_props(color="white", fontweight="bold")
+        else:
+            c.set_facecolor(ARKA["TAHMIN"] if i % 2 else "#ffffff")
+    ov_ = " | ".join(f"{r}: overlay {o['deger'] * 100:+.3f} yp ({'uygulanıyor' if o['uygula'] else 'yok'})"
+                     for r, o in OVERLAY.items())
+    ax.set_title(f"{HK} tahminleri | bilgi ayı {BILGI} | {ov_}", fontweight="bold", loc="left")
+    plt.show()
 
-# --- 1) Ham veriye ekle (df_raw değişmez; birleşik kopya)
-yeni = pd.DataFrame({"DONEM_1": pd.Series(YENI_DONEMLER, dtype="int64")})
-b_ = pd.DataFrame.from_dict(YENI_BASVURU, orient="index",
-                            columns=["BASVURU_ADEDI", "TOPLAM_ONAYLANAN_LIMIT", KKB_KOL, "MM_SKOR",
-                                     "KALIBRE_PD_AGIRLIKLI"])
-yeni = yeni.join(b_, on="DONEM_1")
-yeni[["MM_SKOR", "KALIBRE_PD_AGIRLIKLI"]] /= 100
-for kod, v in YENI_ONCUL.items():
-    v = v or []
-    yeni[oncul_kolon(kod)] = [x / 100 for x in v] + [np.nan] * (len(yeni) - len(v))
-df_tum_raw = pd.concat([df_raw, yeni], ignore_index=True)
-df_tum_raw["DONEM_1"] = df_tum_raw["DONEM_1"].astype(int)
-for kod, v in K90_YENI.items():                       # yeni kohortların 90_m değerleri (olgunlar df_raw'dan)
-    kol = oncul_kolon(kod)
-    if kol not in df_tum_raw:
-        df_tum_raw[kol] = np.nan
-    df_tum_raw.loc[df_tum_raw["DONEM_1"].isin(YENI_DONEMLER[:len(v)]), kol] = np.array(v) / 100
 
-# --- 2) Bölüm 3 ve 4'ün aynı fonksiyonlarıyla hazırla
-d_tum, _, _, K90_TUM = veri_hazirla(df_tum_raw, CONFIG)
-for kol in K90_TUM:                                   # bilgi ayında tamamlanmamış 90_m -> NaN
-    m_ = int(kol.split("_")[3])
-    d_tum.loc[(d_tum["AY"] + m_ + CONFIG["RAPOR_GECIKME_AY"]) >= BILGI, kol] = np.nan
-d_tum = d_tum.join(ortalama_uret(d_tum, BILGI))
+def bolge_boya(ax, alanlar):
+    for ad, (p0, p1) in alanlar.items():
+        x0, x1 = ts(p0) - pd.Timedelta(days=15), ts(p1) + pd.Timedelta(days=15)
+        ax.axvspan(x0, x1, color=ARKA[ad], zorder=0)
+        ax.text(x0 + (x1 - x0) / 2, 1.01, {"EGITIM": "EĞİTİM", "VALIDASYON": "VALİDASYON (CV)", "OOT": "OOT",
+                                           "TAHMIN": "TAHMİN"}[ad], transform=ax.get_xaxis_transform(),
+                ha="center", va="bottom", fontsize=9, fontweight="bold",
+                color=RENK[ad] if ad != "EGITIM" else "#475569")
 
-# Kontrol: olgun kohortların girdileri Bölüm 1–14'teki d ile birebir aynı olmalı (yeni veri geçmişi değiştirmez)
-_kol = [c for c in HAVUZ if c in d.columns]
-_fark = np.nanmax(np.abs(d_tum.loc[d.index, _kol].to_numpy(float) - d[_kol].to_numpy(float)))
-print(f"Olgun kohort girdileri d ile aynı mı? maks fark = {_fark:.1e}", "-> OK" if _fark < 1e-12 else "-> KONTROL ET")
-if len(yeni):
-    print(f"Yeni kohortlar: {len(yeni)} ({YENI_DONEMLER[0]} – {YENI_DONEMLER[-1]}) | ortalama limit son olgun "
-          f"{d_tum['ORTALAMA_LIMIT'].iloc[len(d) - 1]:,.0f} -> ilk yeni {d_tum['ORTALAMA_LIMIT'].iloc[len(d)]:,.0f}")
-else:
-    print("Yeni kohort girilmedi (YENI_DONEMLER boş) -> tahmin üretilmez; Bölüm 15–17 tahminsiz çalışır.")
 
-# --- 3) Final modeller (tüm olgun veri) ve tahmin
-URETIM, FORMUL = {}, {}
-gelecek = d_tum[~d_tum["HEDEF_KULLANILABILIR"]].sort_values("AY")
-TAHMIN = gelecek[["DONEM_1", "AY", "GOZLENEN_AY"]].reset_index(drop=True)
-for rol, spec in MODELLER.items():
-    kol_ = spec["kolonlar"]
-    uret_df = olgun_df.dropna(subset=kol_)
-    m = pipe_fit(model_fabrika(spec["aile"], spec["params"]), uret_df[kol_], uret_df[HEDEF], agirlik_al(uret_df))
-    URETIM[rol] = m
-    if hasattr(m[-1], "coef_"):
-        coef = np.ravel(m[-1].coef_) / m[0].scale_
-        b0 = float(np.ravel([m[-1].intercept_])[0] - np.dot(coef, m[0].mean_))
-        FORMUL[rol] = f"{HK} = {b0:.6f} " + " ".join(f"{c:+.6g}·{kisa_ad(k)}" for k, c in zip(kol_, coef))
-    X = gelecek[kol_]
-    ok = X.notna().all(axis=1).to_numpy()
-    ham = np.full(len(X), np.nan)
-    if ok.any():
-        ham[ok] = m.predict(X[ok])
-    ov = OVERLAY[rol]["deger"] if OVERLAY[rol]["uygula"] else 0.0
-    TAHMIN[f"{rol}_HAM"] = np.clip(ham, 0, 1)
-    TAHMIN[f"{rol}_DUZ"] = np.clip(ham - ov, 0, 1)
-    if len(X) and not ok.any():
-        eksik_ = [kisa_ad(c) for c in kol_ if X[c].isna().all()]
-        print(f"UYARI {rol}: tahmin üretilemedi, eksik girdi -> {eksik_} (YENI_ONCUL'u doldur)")
+def ana_grafik(rol):
+    spec, w = MODELLER[rol], WF[rol]
+    kol = spec["kolonlar"]
+    egit = olgun_df[olgun_df["AY"] < VAL_BAS].dropna(subset=kol)
+    m_eg = pipe_fit(model_fabrika(spec["aile"], spec["params"]), egit[kol], egit[HEDEF])
+    seg = {"EGITIM": pd.DataFrame({"AY": egit["AY"], "GERCEK": egit[HEDEF], "TAHMIN": m_eg.predict(egit[kol])}),
+           "VALIDASYON": w[(w["BOLGE"] == "GELISTIRME") & (w["AY"] >= VAL_BAS)],
+           "OOT": w[w["BOLGE"] == "OOT"]}
+    alanlar = {k: (v["AY"].min(), v["AY"].max()) for k, v in seg.items()}
+    if len(TAHMIN):
+        alanlar["TAHMIN"] = (TAHMIN["AY"].min(), TAHMIN["AY"].max())
 
-# --- 4) Chain-ladder (modelden bağımsız): bilinen en geç 90_m / olgunlaşma oranı (son 12 olgun kohort)
-olgun_tum = d_tum[d_tum["HEDEF_KULLANILABILIR"]]
-OLGUNLASMA, OLG_STD = {}, {}
-for k in K90_TUM:
-    m_ = int(k.split("_")[3])
-    r_ = (olgun_tum[k] / olgun_tum[HEDEF]).dropna().tail(12)
-    if len(r_) >= 6:
-        OLGUNLASMA[m_], OLG_STD[m_] = float(r_.mean()), float(r_.std())
-cl, kay = np.full(len(gelecek), np.nan), [None] * len(gelecek)
-for j, (_, r) in enumerate(gelecek.iterrows()):
-    for m_ in sorted(OLGUNLASMA, reverse=True):
-        v = r.get(oncul_kolon(f"90_{m_}"))
-        if pd.notna(v):
-            cl[j], kay[j] = v / OLGUNLASMA[m_], f"90_{m_}"
-            break
-TAHMIN["CHAIN_LADDER"], TAHMIN["CL_KAYNAK"] = cl, kay
-if OLGUNLASMA:
-    print("Olgunlaşma oranı (90_m / 90_12, son 12 olgun kohort):",
-          {f"90_{m_}": f"{OLGUNLASMA[m_]:.3f} ± {OLG_STD[m_]:.3f}" for m_ in sorted(OLGUNLASMA)})
-else:
-    print("Chain-ladder hesaplanmadı: olgun kohortlarda 90_4/5/6 ADETSEL kolonu yok (df_raw_adetsel.csv'ye ekle).")
-display(TAHMIN.drop(columns="AY").style.format(
-    {**{c: "{:.2%}" for c in TAHMIN.columns if c.endswith(("_HAM", "_DUZ")) or c == "CHAIN_LADDER"},
-     "DONEM_1": "{:.0f}"}, decimal=",", na_rep="-"))
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3.2, 1.25], hspace=0.12)
+    ax = fig.add_subplot(gs[0])
+    bolge_boya(ax, alanlar)
+    hist = olgun_df.sort_values("AY")
+    ax.plot(hist["AY"].dt.to_timestamp(), hist[HEDEF] * 100, "o-", color=RENK["GERCEK"], lw=2.2, ms=4,
+            label="Gerçekleşen", zorder=5)
+    etiket = {"EGITIM": "Eğitim uyumu (in-sample)", "VALIDASYON": "Validasyon (walk-forward)",
+              "OOT": "OOT (walk-forward)"}
+    for k, s in seg.items():
+        ax.plot(s["AY"].dt.to_timestamp(), s["TAHMIN"] * 100, "o-" if k != "EGITIM" else "-",
+                color=RENK[k], lw=2, ms=4, label=etiket[k], zorder=4)
+    if len(TAHMIN):
+        tx = TAHMIN["AY"].dt.to_timestamp()
+        ax.plot(tx, TAHMIN[f"{rol}_DUZ"] * 100, "D-", color=RENK["TAHMIN"], lw=2.4, ms=6,
+                label="Tahmin (overlay sonrası)", zorder=6)
+        ax.plot(tx, TAHMIN[f"{rol}_HAM"] * 100, "D--", color=RENK["TAHMIN"], lw=1.2, ms=4, alpha=0.6,
+                label="Tahmin (ham)", zorder=6)
+        if "CHAIN_LADDER" in TAHMIN:
+            ax.plot(tx, TAHMIN["CHAIN_LADDER"] * 100, "s:", color=RENK["KISMI"], lw=1.4, ms=5,
+                    label="Chain-ladder (90_m'den, modelden bağımsız)", zorder=5)
+    ax.yaxis.set_major_formatter(PCT_AX)
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 7]))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.grid(alpha=0.25); ax.set_ylabel(f"{HK} (12 ayda 90+ gecikme oranı)")
+    ax.legend(loc="lower left", bbox_to_anchor=(0, 1.07), fontsize=8.5, ncol=4, frameon=False)
+    ax.set_title(f"{spec['ad']}\n{FORMUL.get(rol, '')}", fontsize=11.5, fontweight="bold", loc="left", pad=62)
+
+    axt = fig.add_subplot(gs[1]); axt.axis("off")
+    satirlar, renkler = [], []
+    for k in ["EGITIM", "VALIDASYON", "OOT"]:
+        s = seg[k]
+        mm = metrik(s["GERCEK"], s["TAHMIN"])
+        dm = metrik(s["GERCEK"], s["DUMMY"]) if "DUMMY" in s else {}
+        satirlar.append([{"EGITIM": "Eğitim (in-sample)", "VALIDASYON": "Validasyon (walk-forward)",
+                          "OOT": "OOT (walk-forward)"}[k], f"{alanlar[k][0]} – {alanlar[k][1]}", mm["N"],
+                         sayi(mm["WMAPE"]), sayi(mm["MAE_yp"], 3), f"{mm['SAPMA_yp']:+.3f}".replace(".", ","),
+                         sayi(mm["R2"], 3), sayi(mm["KORELASYON"], 3), mm["YON"],
+                         sayi(1 - mm["WMAPE"] / dm["WMAPE"], 2) if dm else "-"])
+        renkler.append(ARKA[k])
+    if len(TAHMIN) and TAHMIN[f"{rol}_HAM"].notna().any():
+        t_ = TAHMIN.dropna(subset=[f"{rol}_HAM"])
+        satirlar.append(["Tahmin (olgunlaşmamış)", f"{t_['AY'].min()} – {t_['AY'].max()}", len(t_),
+                         "-", "-", f"ham ort. {yuzde(t_[f'{rol}_HAM'].mean())}",
+                         f"ovl {yuzde(t_[f'{rol}_DUZ'].mean())}",
+                         f"CL {yuzde(t_['CHAIN_LADDER'].mean()) if 'CHAIN_LADDER' in t_ else '-'}", "-", "-"])
+        renkler.append(ARKA["TAHMIN"])
+    tbl = axt.table(cellText=satirlar, colLabels=["Bölge", "Kohortlar", "N", "WMAPE", "MAE (yp)", "Sapma (yp)",
+                                                 "R²", "Korelasyon", "Yön isabeti", "Beceri*"],
+                    cellLoc="center", loc="center", colWidths=[.17, .15, .05, .07, .08, .12, .07, .09, .09, .08])
+    tbl.auto_set_font_size(False); tbl.set_fontsize(9.5); tbl.scale(1, 1.6)
+    for (i, j), c in tbl.get_celld().items():
+        c.set_edgecolor("#e5e7eb")
+        if i == 0:
+            c.set_facecolor("#1f2937"); c.set_text_props(color="white", fontweight="bold")
+        else:
+            c.set_facecolor(renkler[i - 1])
+    axt.text(0, -0.02, "* Beceri = 1 − WMAPE / naif ortalama WMAPE. yp = yüzde puan. Walk-forward: her kohort, kendi "
+                       "tahmin anında hedefi belli olan kohortlarla eğitilen modelle tahmin edilir.",
+             transform=axt.transAxes, fontsize=8, color="#6b7280")
+    plt.show()
+
+
+def model_karsilastirma():
+    fig, axs = plt.subplots(1, 3, figsize=(16, 4.3))
+    p = PERF.set_index(["MODEL", "BOLGE"])
+    x = np.arange(2)
+    renkler = {"CHAMPION": RENK["TAHMIN"], "CHALLENGER": RENK["CHALLENGER"], "REFERANS_V4": RENK["REFERANS"]}
+    roller = list(MODELLER)
+    gen = 0.8 / (len(roller) + 1)
+    for i, rol in enumerate(roller + ["DUMMY"]):
+        v = [p.loc[(roller[0], b), "DUMMY_WMAPE"] if rol == "DUMMY" else p.loc[(rol, b), "WMAPE"]
+             for b in ["VALIDASYON", "OOT"]]
+        bars = axs[0].bar(x + (i - len(roller) / 2) * gen, v, gen, color=renkler.get(rol, RENK["DUMMY"]),
+                          label="Naif ortalama" if rol == "DUMMY" else rol.replace("_", " ").title())
+        axs[0].bar_label(bars, labels=[sayi(t, 1) for t in v], fontsize=8)
+    axs[0].set_xticks(x, ["Validasyon", "OOT"]); axs[0].set_title("WMAPE (düşük = iyi)", fontweight="bold")
+    axs[0].legend(fontsize=8)
+    for j, (t, baslik, vurgu) in enumerate([(OZET_VARYANT, "Takvim etkisi", "Yok"),
+                                             (OZET_BILGI_AY, "Öncül olgunluğu (ay)", CHAMP["bilgi_ay"])], 1):
+        t = t.dropna(subset=["EN_IYI_CV_WMAPE"])
+        renk = [RENK["TAHMIN"] if str(k) == str(vurgu) else "#cbd5e1" for k in t.index]
+        bars = axs[j].bar([str(k) for k in t.index], t["EN_IYI_CV_WMAPE"], color=renk)
+        axs[j].bar_label(bars, labels=[sayi(v) for v in t["EN_IYI_CV_WMAPE"]], fontsize=8)
+        axs[j].set_title(f"{baslik}: en iyi CV WMAPE", fontweight="bold")
+        axs[j].set_ylim(0, t["EN_IYI_CV_WMAPE"].max() * 1.2)
+    for a in axs:
+        a.grid(axis="y", alpha=0.25)
+    plt.tight_layout(); plt.show()
+
+
+def donusum_grafigi():
+    if not oran_onc:
+        return
+    fig, ax = plt.subplots(figsize=(16, 4))
+    ref_ = DONUSUM.loc[DONUSUM.index < str(VAL_BAS.year + 1)]
+    for c, renk in zip(oran_onc, [RENK["TAHMIN"], RENK["OOT"], RENK["CHALLENGER"], RENK["VALIDASYON"]]):
+        kol_ = f"HEDEF/{kisa_ad(c)}"
+        endeks = DONUSUM[kol_] / ref_[kol_].mean() * 100
+        ax.plot(DONUSUM.index, endeks, "o-", lw=2.2, color=renk, label=f"{HK} / {kisa_ad(c)}")
+        for xx, v in zip(DONUSUM.index, endeks):
+            ax.annotate(f"{v:.0f}", (xx, v), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=8, color=renk)
+    ax.axhline(100, color="#9ca3af", ls="--", lw=1)
+    ax.set_title(f"Erken gecikmenin batığa dönüşüm oranı (endeks, {DONUSUM.index[0][:4]}–{VAL_BAS.year} ort. = 100)",
+                 fontweight="bold", loc="left")
+    ax.grid(alpha=0.25); ax.legend(fontsize=9)
+    plt.tight_layout(); plt.show()
+
+
+takvim_grafigi(CHAMP["bilgi_ay"])
+for rol in MODELLER:
+    ana_grafik(rol)
+tahmin_tablosu()
+model_karsilastirma()
+donusum_grafigi()
