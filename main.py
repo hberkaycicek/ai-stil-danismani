@@ -1,97 +1,106 @@
-# Kural: kohort c'nin her girdisi, c'nin tahmin anında sistemde olan veriyle üretilir.
-#   - X_Y öncülü, kohort j için ancak j + Y < T ise bilinir (T = verinin geldiği ay)
-#   - Ortalama: sadece ÖNCEKİ kohortlar (shift(1)), limit ağırlıklı, tam pencere. Lead YASAK.
-HAM_HAVUZ = ONCULLER + ORTAK_ALANLAR
-KOLON_AYI = {c: 0 for c in ORTAK_ALANLAR + TAKVIM_KOL}
-KOLON_AYI.update({oncul_kolon(k): oncul_ay(k) for k in ONCU_KODLARI})
+# Her bilgi ayı için ayrı fold seti. Bloğun ilk kohortu tahmin_ayi_hesapla(AY, b) anında tahmin edilir;
+# eğitimde sadece hedefi o anda BELLİ olan kohortlar (AY + 12 + gecikme < tahmin anı) kalır.
+# 2. ay modelinde 10, 3. ayda 9, 6. ayda 6 kohort eğitimden çıkar.
+MIN_TRAIN = CONFIG["MIN_TRAIN"]
+cv_df = d.loc[gel_idx].sort_values("AY").reset_index(drop=True)
+Y_CV = cv_df[HEDEF].to_numpy(dtype=float)
+AY_CV = pd.PeriodIndex(cv_df["AY"])
+AYNO_CV = AY_CV.asi8
+TOL = float(CONFIG["YON_TOLERANSI"])
 
 
-def ortalama_uret(df, T):
-    """T ayının başında bilinen veriyle geçmiş kohort ortalamaları. Dönüş: DataFrame."""
-    x = df.sort_values("AY").copy()
-    for k in ONCU_KODLARI:                                                   # T'de tamamlanmamış öncül -> NaN
-        x.loc[x["AY"] + oncul_ay(k) + CONFIG["RAPOR_GECIKME_AY"] >= T, oncul_kolon(k)] = np.nan
-    w = x[CONFIG["ORTALAMA_AGIRLIK_KOLON"]].astype(float)
-    g = CONFIG["ORTALAMA_GECIKME"]
-    out = {}
-    for kol in HAM_HAVUZ:
-        s = x[kol].astype(float)
-        ws = w.where(s.notna())                                              # boş değerin ağırlığı da sayılmaz
-        for p in CONFIG["ORTALAMA_PENCERELERI"]:
-            mp = p if CONFIG["ORTALAMA_TAM_PENCERE"] else 1
-            pay = (s * ws).shift(g).rolling(p, min_periods=mp).sum()
-            payda = ws.shift(g).rolling(p, min_periods=mp).sum()
-            out[f"{kol}_AGORT{p}"] = pay / payda.where(payda > 0)
-    return pd.DataFrame(out, index=x.index)
+def fold_olustur(bilgi_ayi):
+    foldlar, ozet = [], []
+    tscv = TimeSeriesSplit(n_splits=CONFIG["N_SPLITS"], test_size=CONFIG["TEST_SIZE"])
+    for i, (tr, val) in enumerate(tscv.split(np.arange(len(cv_df))), 1):
+        ilk_tahmin = tahmin_ayi_hesapla(AY_CV[val[0]], bilgi_ayi)
+        tr = tr[(AY_CV[tr] + CONFIG["HEDEF_OLGUNLASMA_AY"] + CONFIG["RAPOR_GECIKME_AY"]) < ilk_tahmin]
+        foldlar.append((tr, val))
+        ozet.append({"FOLD": i, "EGITIM_N": len(tr), "EGITIM": f"{AY_CV[tr[0]]} – {AY_CV[tr[-1]]}",
+                     "BOSLUK (olgunlaşmamış)": int(val[0] - tr[-1] - 1),
+                     "VALIDASYON": f"{AY_CV[val[0]]} – {AY_CV[val[-1]]}", "TAHMIN_ANI": str(ilk_tahmin)})
+    return foldlar, pd.DataFrame(ozet)
 
 
-ORTALAMA_KOL, ORTALAMA_KAYNAK, ORTALAMA_PENCERE = [], {}, {}
-if CONFIG["ORTALAMA_DENE"]:
-    g_, pencereler = CONFIG["ORTALAMA_GECIKME"], CONFIG["ORTALAMA_PENCERELERI"]
-    if not isinstance(g_, int) or g_ < 1:
-        raise ValueError("Ortalama gecikmesi pozitif tam sayı olmalı (shift(0) kohortun kendisini içerir).")
-    ORT_DF = ortalama_uret(d, BILGI)
-    d = d.drop(columns=[c for c in ORT_DF.columns if c in d.columns]).join(ORT_DF)
-    for kol in HAM_HAVUZ:
-        for p in pencereler:
-            ad = f"{kol}_AGORT{p}"
-            ORTALAMA_KOL.append(ad)
-            ORTALAMA_KAYNAK[ad], ORTALAMA_PENCERE[ad] = kol, p
-            KOLON_AYI[ad] = KOLON_AYI[kol]
-
-    # Point-in-time testi: her kohort için ortalamayı, gelecek satırlar silinmiş veriyle ve kendi
-    # tahmin anında yeniden üret; pipeline'daki değerle aynı değilse sızıntı vardır.
-    pit = []
-    for i in d.index:
-        c_ay = d.loc[i, "AY"]
-        gecmis = d[d["AY"] <= c_ay]
-        for Y in sorted({KOLON_AYI[a] for a in ORTALAMA_KOL}):
-            yeniden = ortalama_uret(gecmis, tahmin_ayi_hesapla(c_ay, Y))      # Y. ay verisinin geldiği ay
-            for a in [a for a in ORTALAMA_KOL if KOLON_AYI[a] == Y]:
-                v1, v2 = d.loc[i, a], yeniden.loc[i, a]
-                if not ((pd.isna(v1) and pd.isna(v2)) or (pd.notna(v1) and pd.notna(v2) and np.isclose(v1, v2))):
-                    pit.append({"KOHORT": str(c_ay), "DEGISKEN": kisa_ad(a), "PIPELINE": v1, "O_GUN": v2})
-    print(f"Point-in-time testi: {len(pit)} uyumsuzluk", "-> sızıntı yok" if not pit else "-> KONTROL ET")
-    if pit:
-        display(pd.DataFrame(pit).head(20))
-
-HAVUZ = HAM_HAVUZ + ORTALAMA_KOL + TAKVIM_KOL
-if len(HAVUZ) != len(set(HAVUZ)) or any("_90_" in c or c == HEDEF for c in HAVUZ):
-    raise ValueError("Tekrarlanan veya yasak model girdisi var.")
-bilgi_ayi_hesapla = lambda kolonlar: max((KOLON_AYI[c] for c in kolonlar), default=0)
+FOLD_CACHE = {}
+def fold_al(b):
+    if b not in FOLD_CACHE:
+        FOLD_CACHE[b] = fold_olustur(b)[0]
+    return FOLD_CACHE[b]
 
 
-def kombinasyon_uygun(kolonlar):
-    aylar = [KOLON_AYI[c] for c in kolonlar if c in ONCULLER]
-    return not CONFIG["AYNI_AYDAN_TEK_ONCUL"] or len(aylar) == len(set(aylar))
+def wmape(y, p):
+    y, p = np.asarray(y, float), np.asarray(p, float)
+    return float(np.abs(p - y).sum() / max(np.abs(y).sum(), 1e-12) * 100)
 
 
-TEMEL_KOMBS = [alt for adet in range(1, CONFIG["MAX_K"] + 1)
-               for alt in combinations(HAM_HAVUZ, adet) if kombinasyon_uygun(alt)]
-VARYANTLAR = [trend + mevsim
-              for trend in ([(), (TREND_KOL,)] if CONFIG["TREND_DENE"] else [()])
-              for mevsim in ([(), tuple(MEVSIM_KOL)] if CONFIG["MEVSIM_DENE"] else [()])]
+def agirlik_al(df):
+    kol = CONFIG["SAMPLE_WEIGHT_KOLON"]
+    return None if kol is None else df[kol].to_numpy(dtype=float)
 
 
-def ortalama_ekleri(temel):
-    uygun = [k for k in ORTALAMA_KOL if ORTALAMA_KAYNAK[k] in temel]       # sadece modeldeki girdinin ortalaması
-    return [()] + [(k,) for k in uygun]
+def pipe_fit(estimator, X, y, w=None):
+    p = make_pipeline(StandardScaler(), clone(estimator))
+    return p.fit(X, y) if w is None else p.fit(X, y, **{f"{p.steps[-1][0]}__sample_weight": w})
 
 
-KOMBS = [temel + ort + takvim
-         for temel in TEMEL_KOMBS for ort in ortalama_ekleri(temel) for takvim in VARYANTLAR
-         if bilgi_ayi_hesapla(temel + ort) <= CONFIG["CHAMPION_MAX_AY"]]
-ADAY_TABLO = pd.DataFrame([{
-    "ADAY_ID": n, "GIRDILER": ", ".join(map(kisa_ad, taban(k))),
-    "TEMEL_K": sum(c in HAM_HAVUZ for c in k), "ORTALAMA_K": sum(c in ORTALAMA_KOL for c in k),
-    "TOPLAM_K": len(k), "BILGI_AY": bilgi_ayi_hesapla(k),
-    "TREND": int(TREND_KOL in k), "MEVSIM": int("SIN_AY" in k),
-    "ORTALAMA": next((f"AGORT{ORTALAMA_PENCERE[c]}" for c in k if c in ORTALAMA_KOL), "Yok"),
-    "SECILEBILIR": TREND_KOL not in k or CONFIG["TREND_SECILEBILIR"],
-    "CHALLENGER": bilgi_ayi_hesapla(k) <= CONFIG["CHALLENGER_MAX_AY"],
-    "KOLONLAR": tuple(k)} for n, k in enumerate(KOMBS, 1)])
-print(f"Havuz: {len(HAM_HAVUZ)} ham + {len(ORTALAMA_KOL)} ortalama + takvim | aday: {len(ADAY_TABLO):,}")
-display(pd.DataFrame([{"Model": "CHAMPION", "Aday": len(ADAY_TABLO)},
-                      {"Model": "CHALLENGER", "Aday": int(ADAY_TABLO["CHALLENGER"].sum())}])
-        .style.hide(axis="index").format({"Aday": "{:,.0f}"}))
-print("Bilgi ayı dağılımı:", ADAY_TABLO["BILGI_AY"].value_counts().sort_index().to_dict())
+def fold_hazirla(kolonlar, foldlar=None):
+    """Aday kolonlarına göre fold'ları hazırlar (ortalamaların boş olduğu ilk kohortlar eğitimden çıkar)."""
+    kolonlar = list(kolonlar)
+    if foldlar is None:
+        foldlar = fold_al(bilgi_ayi_hesapla(kolonlar))
+    X = cv_df[kolonlar].to_numpy(dtype=float)
+    dolu = ~np.isnan(X).any(axis=1)
+    hazir = []
+    for tr, val in foldlar:
+        tr = tr[dolu[tr]]
+        if len(tr) < MIN_TRAIN:
+            raise ValueError(f"eğitim yetersiz ({len(tr)} < {MIN_TRAIN})")
+        if not dolu[val].all():
+            raise ValueError("validasyonda boş değer")
+        hazir.append((tr, val))
+    return X, hazir
+
+
+def metrik_ozet(kayitlar):
+    """kayitlar: her fold için (tr, val, p_val, p_tr). Bütün adaylar AYNI fonksiyonla ölçülür."""
+    y = Y_CV
+    hata, gercek, f_wmape, f_sapma, f_oran = [], [], [], [], []
+    d_g, d_t, aralik_disi = [], [], 0
+    for tr, val, p, p_tr in kayitlar:
+        f_wmape.append(wmape(y[val], p))
+        f_sapma.append(float(np.mean(p - y[val])))
+        f_oran.append(f_wmape[-1] / max(wmape(y[tr], p_tr), 1e-12))
+        aralik_disi += int(((p < 0) | (p > 2 * y[tr].max())).sum())
+        bit = np.diff(AYNO_CV[val]) == 1
+        d_g.extend(np.diff(y[val])[bit]); d_t.extend(np.diff(p)[bit])
+        hata.extend(p - y[val]); gercek.extend(y[val])
+    hata, gercek, d_g, d_t = map(np.asarray, (hata, gercek, d_g, d_t))
+    anlamli = np.abs(d_g) > TOL
+    dogru = np.sign(np.where(np.abs(d_t) <= TOL, 0, d_t))[anlamli] == np.sign(d_g[anlamli])
+    buy = np.abs(d_g[anlamli])
+    return {
+        "CV_WMAPE": float(np.abs(hata).sum() / gercek.sum() * 100),
+        "CV_MAE": float(np.mean(np.abs(hata))), "CV_SAPMA": float(np.mean(hata)),
+        "MUTLAK_FOLD_SAPMA": float(np.mean(np.abs(f_sapma))),
+        "EN_KOTU_WMAPE": float(np.max(f_wmape)), "FOLD_WMAPE_STD": float(np.std(f_wmape)),
+        "OVERFIT_ORANI": float(np.median(f_oran)),
+        "DELTA_MAE": float(np.mean(np.abs(d_t - d_g))) if len(d_g) else np.nan,
+        "YON_AGIRLIKLI": float((buy * dogru).sum() / buy.sum()) if anlamli.any() else np.nan,
+        "ARALIK_DISI": aralik_disi, "FOLD1_EGITIM_N": len(kayitlar[0][0]),
+    }
+
+
+def cv_degerlendir(kolonlar, estimator, foldlar=None):
+    X, hazir = fold_hazirla(kolonlar, foldlar)
+    kayitlar = []
+    for tr, val in hazir:
+        w = None if CONFIG["SAMPLE_WEIGHT_KOLON"] is None else cv_df.iloc[tr][CONFIG["SAMPLE_WEIGHT_KOLON"]].to_numpy()
+        m = pipe_fit(estimator, X[tr], Y_CV[tr], w)
+        kayitlar.append((tr, val, m.predict(X[val]), m.predict(X[tr])))
+    return metrik_ozet(kayitlar)
+
+
+DUMMY = cv_degerlendir([HAM_HAVUZ[0]], DummyRegressor(strategy="mean"), fold_al(0))
+print(f"Naif referans (geçmiş ortalama): CV_WMAPE {DUMMY['CV_WMAPE']:.2f} | "
+      f"EN_KOTU {DUMMY['EN_KOTU_WMAPE']:.2f} | MUTLAK_FOLD_SAPMA {DUMMY['MUTLAK_FOLD_SAPMA']:.4f}")
