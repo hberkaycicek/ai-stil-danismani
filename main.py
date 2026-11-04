@@ -1,42 +1,104 @@
-Kısaca: CV, geçmişte gerçekten yaşayacağın tahmin anını taklit etmeli. O an elinde olmayan bir bilgiyi modele verirsen CV, gerçekte yapacağın işten daha kolay bir işi ölçer.
+CONFIG = {
+    # Hedef
+    "HEDEF_TUR": "TUTARSAL",
+    "HEDEF_SON": "90_12",
 
-Gerçek hayatta durum (bugün, 2026-11)
+    # Bölme (zaman bazlı)
+    "GELISTIRME_ARALIK": (202101, 202409),    # eğitim + walk-forward CV + model seçimi
+    "OOT_ARALIK": (202410, 202509),           # seçimde hiç kullanılmaz, sadece ölçüm
 
-2026-09 kohortunu tahmin etmek istiyorsun. 2. ay öncülü (30_2) bugün belli oldu. Modeli eğitmek için hedefi (12M90) kesinleşmiş kohortlar lazım:
+    # Olgunlaşma: M kohortunun 12. ay verisi M+12 ayının ilk haftasında gelir (202509 -> 202610)
+    "BILGI_AYI": "2026-10",
+    "HEDEF_OLGUNLASMA_AY": 12,
+    "RAPOR_GECIKME_AY": 0,
 
-Kohort:   ... 2025-09  2025-10 | 2025-11 ... 2026-08 | 2026-09
-12M90:     belli     belli     |  HENÜZ BELLİ DEĞİL  | tahmin edilecek
-                               |  (12 ay dolmadı)    |
-Eğitim:   ✅ kullanılır         | ❌ 10 kohort boşluk  | 🎯
+    # Walk-forward CV (her bilgi ayı için ayrı fold seti, olgunlaşma boşluklu)
+    "N_SPLITS": 5, "TEST_SIZE": 4,
+    "MIN_TRAIN": 9,                           # AGORT6 + 2. ayda Fold1 eğitimi 9 kohort (Bölüm 7)
 
-2025-11 ile 2026-08 arası 10 kohortun 12 ayı daha dolmadı, yani 90+ değerleri yok. Canlıda bu 10 aylık boşluk her zaman olacak. Modelin elindeki en yeni bilgi 10 ay eski.
+    # Aday havuzu
+    "CHAMPION_MAX_AY": 6, "CHALLENGER_MAX_AY": 3,
+    "MAX_K": 2, "AYNI_AYDAN_TEK_ONCUL": True,
+    "MODEL_AILELERI": ["Linear", "Ridge", "Lasso", "ElasticNet"],
+    # Ceza katsayısı (alpha) DIŞ walk-forward CV'de seçilir: her alpha ayrı aday, aynı boşluklu fold'lar.
+    # (İç CV'ye olgunlaşma boşluğu konunca ilk fold'larda 0-6 eğitim kohortu kalıyor; uygulanamaz.)
+    # Ölçek: X standart, y ham (~0,015). Ridge cezası X ölçeğinde, Lasso/EN cezası hedef ölçeğinde.
+    "ALPHA_RIDGE": np.logspace(-2, 2, 9),
+    "ALPHA_LASSO": np.logspace(-6, -2.5, 8),
+    "L1_ORANLARI": [0.2, 0.5, 0.8],           # ElasticNet (1.0 = Lasso, ayrı aile)
+    "MAX_ITER": 100000, "MODEL_TOL": 1e-8,
 
-Yeni çalışmadaki CV ne yapıyor
+    # Takvim
+    "TREND_DENE": True,                       # rapor için denenir
+    "TREND_SECILEBILIR": False,               # DÜZELTME: trend geleceğe doğrusal uzanır -> seçilemez
+    "TREND_ORIJIN": "2021-01",
+    "MEVSIM_DENE": True,
+    "YON_TOLERANSI": 0.0005,
 
-Fold1'de validasyon 2023-02 kohortuyla başlıyor. Bu kohortu 2. ay modeliyle gerçekte 2023-04'te tahmin ederdin. O tarihte hedefi belli olan son kohort 2022-03. Ama yeni çalışmada eğitim 2023-01'e kadar uzanıyor:
+    # Geçmiş kohort ortalamaları (limit ağırlıklı, sadece önceki kohortlar)
+    "ORTALAMA_DENE": True,
+    "ORTALAMA_PENCERELERI": [3, 6],
+    "MAX_ORTALAMA": 1,
+    "ORTALAMA_TAM_PENCERE": True,
+    "ORTALAMA_GECIKME": 1,
+    "ORTALAMA_AGIRLIK_KOLON": "TOPLAM_ONAYLANAN_LIMIT",
+    "LIMIT_KOLON": "TOPLAM_ONAYLANAN_LIMIT",
+    "LIMIT_PAYDA_KOLON": "BASVURU_ADEDI",
+    "TUFE_KOLON": None, "SAMPLE_WEIGHT_KOLON": None,
+    # İstersen hacim değişkenleri de aday olur (ör. ["BASVURU_ADEDI"]). Nominal tutarlar enflasyonla
+    # trend gibi davranır; eklenirse TUFE ile reelleştir.
+    "EK_BASVURU_ALANLARI": [],
 
-Eğitim (yeni çalışma):   2021-07 ........ 2022-03 | 2022-04 ... 2023-01 | VAL 2023-02..
-                                                    ↑ bu 10 kohortun 12M90'ı
-                                                      2023-04'te henüz yoktu
-                                                      (2023-05 ile 2024-02 arası geldi)
+    # Sıralama ve geçerlilik (naif ortalama modeline göre)
+    "AGIRLIK": {"CV_WMAPE": 0.30, "EN_KOTU_WMAPE": 0.12, "FOLD_WMAPE_STD": 0.12,
+                "OVERFIT_ORANI": 0.15, "DELTA_MAE": 0.12, "MUTLAK_FOLD_SAPMA": 0.19},
+    "GECERLI": {"CV_WMAPE_DUMMY_ORAN": 0.50, "EN_KOTU_DUMMY_ORAN": 0.75,
+                "OVERFIT_ORANI_MAX": 2.0, "SAPMA_DUMMY_ORAN": 0.35},
 
-Yani model, o tarihte gelecekte açıklanacak cevaplarla eğitiliyor. Sınavdan önce, henüz açıklanmamış soruların cevap anahtarına bakmak gibi.
+    # Seçim: anlamlılık (HAC, sadece geliştirme verisi) + 1-SE + sadelik
+    "HAC_P_ESIK": 0.10,
+    "HAC_ILK_N": 1000,
+    "CHALLENGER_FARKLI_GIRDI": True,
 
-Neden bu kadar önemli
+    # Optuna (sağlamlık kontrolü; doğrusal olmayan aileler raporlanır, seçilemez)
+    "OPTUNA_CALISTIR": True, "OPTUNA_TRIALS": 60, "OPTUNA_SET_SAYISI": 20,
+    "FORMUL_AILELERI": ["Linear", "Ridge", "Lasso", "ElasticNet", "Ridge*", "Lasso*",
+                        "ElasticNet*", "Huber"],
 
-	1.	Sızan bilgi en değerli bilgi. Komşu kohortlar birbirine çok benziyor (rho 0,75). Validasyon kohortunu en iyi açıklayan şey, hemen önceki kohortların gerçekleşmesi. Boşluk olmayınca model "son dönemin seviyesini" bedavaya öğreniyor.
-	2.	Rejim kırılmasını haksız yere yakalıyor. 2024'te 60+ gecikmelerin batığa dönüşüm oranı düştü. Gerçekte model bunu ancak ~10 ay sonra fark eder. Sızıntılı CV ise hemen biliyor, bu yüzden hata küçük görünüyor.
-	3.	Sonuç iyimser rakam. Boşluksuz CV'de hata 6–8, boşluklu (sızıntısız) kurguda 9–12 çıkıyordu. Canlıda göreceğin hata ikinci aralığa yakın olur. Model seçimi de yanlış rakama göre yapılmış olur.
+    # Seviye düzeltmesi (overlay)
+    "OVERLAY_PENCERE": 12, "OVERLAY_MIN_AYNI_ISARET": 10,
+}
 
-Boşluk ne kadar olmalı
+KKB_KOL = next((c for c in ["KKB_SKOR_O0120", "KKB_SKOR_00120"] if c in df_raw.columns), "KKB_SKOR_O0120")
+ORTAK_ALANLAR = [KKB_KOL, "MM_SKOR", "KALIBRE_PD_AGIRLIKLI", "ORTALAMA_LIMIT"] + list(CONFIG["EK_BASVURU_ALANLARI"])
+ONCU_KODLARI = ["20_2", "30_2", "30_3", "60_3", "30_4", "60_4", "30_5", "60_5", "30_6", "60_6"]
+MEVSIM_KOL, TREND_KOL = ["SIN_AY", "COS_AY"], "TREND_IDX"
+TAKVIM_KOL = MEVSIM_KOL + [TREND_KOL]
 
-Boşluk, kaçıncı ayda tahmin yaptığına bağlı: 12 − bilgi ayı kadar kohort.
+oncul_kolon = lambda kod, tur=None: f"KK_TAKIP_{kod}_{tur or CONFIG['HEDEF_TUR']}"
+oncul_ay = lambda kod: int(kod.split("_")[1])
+kisa_ad = lambda k: k.replace("KK_TAKIP_", "").replace(f"_{CONFIG['HEDEF_TUR']}", "")
+taban = lambda kolonlar: [c for c in kolonlar if c not in TAKVIM_KOL]
 
-Model	Tahmin anı	Eğitimden çıkan kohort sayısı
-2. ay (30_2)	AY + 2	10
-3. ay (60_3)	AY + 3	9
-6. ay (60_6)	AY + 6	6
 
-Yamadaki fold_al(bilgi_ay) bunu yapıyor: her fold'da sadece AY + 12 < tahmin_ayı olan kohortları eğitimde bırakıyor. CV böylece canlıdaki şartları birebir taklit ediyor.
+def tahmin_ayi_hesapla(kohort_ayi, bilgi_ayi):
+    """Kohortun Y. ay verisi, Y. ayın bittiği ayın BİR SONRAKİ ayının ilk haftasında gelir.
+    Tek erişim takvimi: öncül, PIT testi, CV fold'ları, OOT ve üretim hep bunu kullanır.
+    Bir verinin bu anda bilinmesi için: erişim_ayı (= kohort + Y + gecikme) < tahmin_ayı."""
+    return kohort_ayi + int(bilgi_ayi) + CONFIG["RAPOR_GECIKME_AY"] + 1
+if not np.isclose(sum(CONFIG["AGIRLIK"].values()), 1):
+    raise ValueError("Sıralama ağırlıkları toplamı 1 olmalı.")
 
-Aynı mantık OOT için de geçerli (Kritik 2): OOT'de her kohort, kendi tahmin anında hedefi belli olan verilerle tahmin edilmeli.
+display(pd.DataFrame([
+    {"Başlık": "Geliştirme", "Değer": f"{CONFIG['GELISTIRME_ARALIK'][0]}–{CONFIG['GELISTIRME_ARALIK'][1]}"},
+    {"Başlık": "Bağımsız OOT", "Değer": f"{CONFIG['OOT_ARALIK'][0]}–{CONFIG['OOT_ARALIK'][1]}"},
+    {"Başlık": "Bilgi ayı (bugün)", "Değer": CONFIG["BILGI_AYI"]},
+    {"Başlık": "Walk-forward CV", "Değer": f"{CONFIG['N_SPLITS']} × {CONFIG['TEST_SIZE']} ay, bilgi ayına göre "
+                                          f"olgunlaşma boşluklu; alpha da bu CV'de seçilir"},
+    {"Başlık": "Champion / Challenger", "Değer": f"En fazla {CONFIG['CHAMPION_MAX_AY']} / "
+                                                 f"{CONFIG['CHALLENGER_MAX_AY']} aylık öncül"},
+    {"Başlık": "Aday yapısı", "Değer": f"1–{CONFIG['MAX_K']} ham girdi + en fazla {CONFIG['MAX_ORTALAMA']} "
+                                       f"geçmiş ortalama + takvim"},
+    {"Başlık": "Seçim", "Değer": f"HAC p ≤ {CONFIG['HAC_P_ESIK']} + 1-SE + sadelik; trend seçilemez"},
+    {"Başlık": "KKB kolonu", "Değer": KKB_KOL},
+]).style.hide(axis="index"))
