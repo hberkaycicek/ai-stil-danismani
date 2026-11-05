@@ -1,8 +1,16 @@
-import io
+import pyarrow as pa, pyarrow.ipc as ipc
 
-with FEATHER_ARSIV.get_download_stream(feather_path) as s:
-    raw = s.read()
+print("Byte:", len(raw))      # lokaldeki dosya boyutuyla karşılaştır (Özellikler → Boyut, byte cinsinden)
 
-print("Boyut:", round(len(raw) / 1e6, 1), "MB")
-print("İlk byte'lar:", raw[:12])
-print("Son byte'lar:", raw[-12:])
+reader = ipc.open_stream(pa.BufferReader(pa.py_buffer(raw).slice(8)))   # 'ARROW1\0\0' başlığını atla
+batches = []
+try:
+    for b in reader:
+        batches.append(b)
+except Exception as e:
+    print("Okuma durdu:", type(e).__name__, str(e)[:200])
+
+tar = pa.Table.from_batches(batches, schema=reader.schema).to_pandas()
+del batches
+print("Kurtarılan:", tar.shape)
+print("DONEM:", tar["DONEM"].min(), "→", tar["DONEM"].max())
