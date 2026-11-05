@@ -18,14 +18,7 @@ t0 = datetime.now()
 
 # =========================================================
 # 0) PARAMETRELER
-# =========================================================
-TEST_MODU = True          # True: mailler sadece SENDER'a gider. Canlıda False
-SMTP_HOST = "smtp.akbank.com"
-SENDER    = "xxxx@akbank.com"
-TO        = ["xxxx@akbank.com"]
-CC        = ["xxxx@akbank.com"]
 
-PSI_ESIK  = 0.2
 GINI_ESIK = 0.2
 
 BASLANGIC  = pd.Period("2024-10", freq="M")                    # verinin başladığı ay
