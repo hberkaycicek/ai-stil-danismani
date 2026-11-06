@@ -1,41 +1,30 @@
-folder  = dataiku.Folder(FOLDER_ID)
-adaylar = [p for p in folder.list_paths_in_partition()
-           if os.path.basename(p).lower().startswith(FEATHER_ONEK)]
-print("Bulunan:", adaylar)
-assert len(adaylar) == 1, "lds_old ile başlayan tek dosya olmalı"
+import pyarrow.ipc as ipc
 
-with folder.get_download_stream(adaylar[0]) as s:
-    raw = s.read()
-print("Boyut:", round(len(raw) / 1e9, 2), "GB | baş:", raw[:6], "| son:", raw[-6:])
+# Teşhis: sondaki sıfır bölge ne kadar büyük?
+n, mv, i, step = len(raw), memoryview(raw), len(raw), 1 << 20
+while i > 0:
+    blok = bytes(mv[max(0, i - step):i]).rstrip(b"\x00")
+    if blok:
+        i = max(0, i - step) + len(blok); break
+    i -= step
+print(f"Toplam byte: {n:,} | sondaki sıfır: {n - i:,} byte")
 
-
-
-
-
-f_kolon = pa.ipc.open_file(pa.BufferReader(raw)).schema.names
-eksik = [c for c in KOLONLAR if c not in f_kolon]
+# Kurtarma: 'ARROW1\0\0' başlığını atla, record batch'leri sırayla oku
+reader = ipc.open_stream(pa.BufferReader(pa.py_buffer(raw).slice(8)))
+eksik = [c for c in KOLONLAR if c not in reader.schema.names]
 if eksik:
-    raise KeyError(f"Feather'da eksik kolon {eksik} | mevcut: {f_kolon}")
+    raise KeyError(f"Feather'da eksik kolon {eksik} | mevcut: {reader.schema.names}")
 
-tar = pf.read_feather(pa.BufferReader(raw), columns=KOLONLAR)
-del raw
+parcalar, hata = [], None
+try:
+    for b in reader:
+        parcalar.append(pa.Table.from_batches([b]).select(KOLONLAR))
+except Exception as e:
+    hata = e
+print("Okunan batch:", len(parcalar), "| durma sebebi:", repr(hata) if hata else "temiz bitti")
+
+tar = pa.concat_tables(parcalar).to_pandas()
+del parcalar, raw, mv
 tar = standartla(tar, "FEATHER")
 print("FEATHER:", tar.shape, tar[DONEM].min(), "→", tar[DONEM].max())
-
-
-
-
-birlesik = pd.concat([lds, tar], ignore_index=True)
-cakisma = birlesik[ID].duplicated(keep="first").sum()
-print(f"Çakışan başvuru: {cakisma:,}")
-if cakisma:
-    birlesik = birlesik.drop_duplicates(ID, keep="first")   # çakışmada güncel LDS kaydı kalır
-del lds, tar
-
-print("BİRLEŞİK:", birlesik.shape)
-display(birlesik.groupby("KAYNAK")[DONEM].agg(["min", "max", "count"]))
-
-
-
-dataiku.Dataset("LDS_MPS_TRD_HARIC_BIRLESIK").write_with_schema(birlesik)
-print("Yazıldı:", birlesik.shape)
+display(tar[DONEM].value_counts().sort_index())
