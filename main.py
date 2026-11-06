@@ -1,1 +1,28 @@
-print("Gönderildi:", subject, "->", to + cc, "| toplam süre:", datetime.now() - t0)aa
+WITH TEKIL AS (
+  SELECT ROW_NUMBER() OVER (PARTITION BY t1.KDS_BOUT_MBB_NO, TO_CHAR(t1.KDS_BOUT_ISLEM_ZAMANI,'YYYYMM')
+                            ORDER BY TRUNC(t1.KDS_BOUT_ISLEM_ZAMANI) DESC) AS SIRA,
+         TO_CHAR(t1.KDS_BOUT_ISLEM_ZAMANI,'YYYYMM') AS ISLEM_DONEM,
+         t1.KDS_BOUT_MBB_NO,
+         t1.KDS_BOUT_G1053     AS ONAY_RET,
+         t2.KDS_TON_ONAY_O5233 AS MM_SKOR,
+         t2.KDS_TON_ONAY_O0120 AS KKB_SKOR
+  FROM PODS.KDS_TON_ONAY_OUT_LOG t1
+  LEFT JOIN PKRA.KRA_TSM_BATCH_INPUT t2
+         ON t1.KDS_BOUT_SM_ID  = t2.KDS_TON_ONAY_SM_ID
+        AND t1.KDS_BOUT_MBB_NO = t2.KDS_TON_ONAY_MBB_NO
+  WHERE t1.KDS_BOUT_G5108 = 'YENI'                      -- ← MEVCUT değil YENI
+    AND t1.KDS_BOUT_G1053 IN ('ONAY','RET')
+                                                        -- ← G5035 filtresi YOK
+    AND t1.KDS_BOUT_ISLEM_ZAMANI >= DATE '2023-01-01'
+    AND t1.KDS_BOUT_ISLEM_ZAMANI <  TRUNC(SYSDATE,'MM')
+)
+, GEC AS ( ... DLA'lı SQL'deki ile AYNEN aynı kalsın ... )
+SELECT TO_NUMBER(t.ISLEM_DONEM)                       AS ISLEM_DONEM,
+       CASE WHEN t.ONAY_RET = 'ONAY' THEN 1 ELSE 0 END AS ONAY,
+       t.MM_SKOR, t.KKB_SKOR,                          -- ← DAVRANIS_SKOR yok
+       g.KK_TAKIP_60_4, g.KK_TAKIP_90_12
+FROM TEKIL t
+LEFT JOIN GEC g
+       ON g.KDS_BOUT_MBB_NO = t.KDS_BOUT_MBB_NO
+      AND g.ISLEM_DONEM     = t.ISLEM_DONEM
+WHERE t.SIRA = 1
