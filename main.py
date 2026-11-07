@@ -1,181 +1,91 @@
-# -*- coding: utf-8 -*-
-import dataiku
-import pandas as pd, numpy as np
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from sklearn.metrics import roc_auc_score
-from datetime import datetime
-import warnings
-warnings.filterwarnings("ignore")
-try:
-    from IPython.display import display
-except ImportError:
-    display = print
-t0 = datetime.now()
-
-# =========================================================
-# 0) PARAMETRELER
-# =========================================================
-GIRDI, CIKTI = "YENI_KART_MPS", "YENI_KART_MPS_MAIL"
-SUBJECT = "(Otomatik Mail): Ön Onay Yeni Kart Satış Model Performans Raporu"
-
-TEST_MODU = True
-SMTP_HOST = "smtp.xxxx.com"
-SENDER    = "bxxx"
-TO        = ["xxxx@xxx.com"]
-CC        = ["xxxx@xxxx.com"]
-
-PSI_ESIK, GINI_ESIK = 0.2, 0.2
-INF_KORUMA = True                        # False: boş bin'de orijinaldeki gibi inf
-CHUNK      = 5_000_000
-BAS_INT    = 202301
-REF_BAS, REF_BIT = 202301, 202303        # PSI referansı
-
-SKORLAR = ["MM_SKOR", "KKB_SKOR"]
-BASLIK  = {"MM_SKOR": "Müşteri Model Skor BIN Dağılımı", "KKB_SKOR": "KKB Skor BIN Dağılımı"}
-TAKIP1, MIN1, AD1 = "KK_TAKIP_60_4",  5,  "Gini 4 Ay 60+"
-TAKIP2, MIN2, AD2 = "KK_TAKIP_90_12", 13, "Gini 12 Ay 90+"
-LABELS = [str(i) for i in range(1, 11)]
-
-_vars    = dataiku.get_custom_variables()
-END_DATE = pd.Period(_vars.get("RAPOR_AYI") or pd.Timestamp.now(), freq="M")
-END_INT  = END_DATE.year * 100 + END_DATE.month
-SON_AY   = (END_DATE - 1).year * 100 + (END_DATE - 1).month
-END_IDX  = END_DATE.year * 12 + END_DATE.month
-fmt = lambda d: f"{int(d)//100}-{int(d)%100:02d}"
-print(f"Yeni Kart | rapor ayı {END_DATE} | son ay {fmt(SON_AY)}")
-
-# =========================================================
-# 1) PARÇA PARÇA OKU
-# =========================================================
-KOL = ["ISLEM_DONEM", "ONAY"] + SKORLAR + [TAKIP1, TAKIP2]
-psi_p, gini_p, n = [], [], 0
-for ch in dataiku.Dataset(GIRDI).iter_dataframes(chunksize=CHUNK, columns=KOL):
-    ch = ch.apply(pd.to_numeric, errors="coerce")
-    ch = ch[(ch["ISLEM_DONEM"] >= BAS_INT) & (ch["ISLEM_DONEM"] < END_INT)]
-    ch = ch.astype({"ISLEM_DONEM": "int32", **{c: "float32" for c in SKORLAR + [TAKIP1, TAKIP2]}})
-    psi_p.append(ch[["ISLEM_DONEM"] + SKORLAR])                                       # PSI: tüm başvurular
-    gini_p.append(ch.loc[ch["ONAY"] == 1, ["ISLEM_DONEM"] + SKORLAR + [TAKIP1, TAKIP2]])  # Gini: onaylılar
-    n += len(ch)
-    print(f"{n:,} satır | {datetime.now() - t0}")
-
-psi_df  = pd.concat(psi_p,  ignore_index=True); del psi_p
-gini_df = pd.concat(gini_p, ignore_index=True); del gini_p
-print("PSI verisi:", psi_df.shape, "| Gini verisi (onay):", gini_df.shape)
-if (psi_df["ISLEM_DONEM"] == SON_AY).sum() == 0:
-    raise ValueError(f"{fmt(SON_AY)} dönemine ait kayıt yok!")
-
-# =========================================================
-# 2) METRİKLER
-# =========================================================
-def model_filtre(df, s):                             # orijinal: kkb_df = KKB_SKOR != 0
-    m = df[s].notna()
-    return m & (df[s] != 0) if s != "MM_SKOR" else m
-
-def psi_ve_bin(df, s):
-    d = df.loc[model_filtre(df, s), ["ISLEM_DONEM", s]]
-    ref = d.loc[d["ISLEM_DONEM"].between(REF_BAS, REF_BIT), s]
-    if ref.empty:
-        raise ValueError(f"{s}: referans dönemde skor yok!")
-    q = ref.quantile([.1, .2, .3, .4, .5, .6, .7, .8, .9]).tolist()
-    edges  = sorted(set([-999999] + q + [999999]))
-    labels = [str(i) for i in range(1, len(edges))]
-    base = pd.cut(ref, edges, labels=labels).value_counts(normalize=True).reindex(labels).values
-    ct = pd.crosstab(d["ISLEM_DONEM"], pd.cut(d[s], edges, labels=labels),
-                     normalize="index").reindex(columns=labels, fill_value=0)
-    comp = ct.values
-    with np.errstate(divide="ignore", invalid="ignore"):
-        terim = (comp - base) * np.log(comp / base)
-    if INF_KORUMA:
-        terim = np.where((comp > 0) & (base > 0), terim, 0)
-    return pd.Series(terim.sum(axis=1), index=ct.index, name="PSI"), ct
-
-def gini(y, s):
-    return np.nan if y.nunique() < 2 else 2 * roc_auc_score(y, s) - 1
-
-def gini_tablo(df, s):
-    b = df[model_filtre(df, s)]
-    yas = END_IDX - (b["ISLEM_DONEM"] // 100 * 12 + b["ISLEM_DONEM"] % 100)
-    out = {}
-    for takip, min_yas, ad in [(TAKIP1, MIN1, AD1), (TAKIP2, MIN2, AD2)]:
-        d = b[(yas >= min_yas) & b[takip].notna()]
-        out[ad] = d.groupby("ISLEM_DONEM").apply(lambda x: gini(x[takip].astype(int), x[s]))
-    return pd.DataFrame(out)
-
-parcalar, bt = [], {}
-for s in SKORLAR:
-    psi, ct = psi_ve_bin(psi_df, s)
-    f = gini_tablo(gini_df, s).join(psi, how="outer")
-    f.index.name = "ISLEM_DONEM"
-    parcalar.append(f.reset_index().assign(model=s))
-    t = (ct * 100).round(2).sort_index(ascending=False)
-    t.index = [fmt(i) for i in t.index]
-    bt[s] = t[[c for c in LABELS if c in t.columns]].fillna("*")
-    print(s, "tamam", datetime.now() - t0)
-del psi_df, gini_df
-
-final = pd.concat(parcalar, ignore_index=True)
-final["DONEM"] = final["ISLEM_DONEM"].map(fmt)
-
-# =========================================================
-# 3) TABLO + UYARI
-# =========================================================
-p = final.pivot_table(index="DONEM", columns="model", values=[AD1, AD2, "PSI"], aggfunc="first").abs()
-p = p[[x for x in [AD1, AD2, "PSI"] if x in p.columns.get_level_values(0)]].sort_index(ascending=False)
-
-def renkli_html(t):
-    def hucre(v, metrik):
-        if pd.isna(v):
-            return "*"
-        kirmizi = (metrik == "PSI" and v >= PSI_ESIK) or (metrik.startswith("Gini") and v <= GINI_ESIK)
-        return f'<span style="color:red">{v:.3f}</span>' if kirmizi else f"{v:.3f}"
-    out = t.astype(object).copy()
-    for col in t.columns:
-        out[col] = [hucre(v, col[0]) for v in t[col]]
-    return out.to_html(escape=False)
-
-uy = final[(final["ISLEM_DONEM"] == SON_AY) & (final["PSI"].abs() >= PSI_ESIK)]   # orijinal: sadece son ay
-warning_html = "<br>".join(
-    f"<span style='color:red;font-weight:bold;'>!Dikkat:</span> {r.DONEM} döneminde {r.model} PSI değeri beklenen aralığın üstünde."
-    for r in uy.itertuples())
-
-display(p.round(3))
-print("Uyarı sayısı:", len(uy))
-
-# =========================================================
-# 4) LOG
-# =========================================================
-log = final.rename(columns={"model": "MODEL", AD1: "GINI_4AY_60", AD2: "GINI_12AY_90"})
-log = log.assign(POPULASYON="YENI_KART", RAPOR_AYI=str(END_DATE), RUN_TS=pd.Timestamp.now())
-log = log.reindex(columns=["RAPOR_AYI", "POPULASYON", "DONEM", "MODEL", "GINI_4AY_60",
-                           "GINI_12AY_90", "PSI", "RUN_TS"]).replace([np.inf, -np.inf], np.nan)
-dataiku.Dataset(CIKTI).write_with_schema(log)
-
-# =========================================================
-# 5) MAİL
-# =========================================================
-CSS = """<style>table{border:1px solid black;border-collapse:collapse;table-layout:auto;}
-th,td{border:1px solid black;padding:5px;text-align:center;}</style>"""
-ACIKLAMA = """<div style="font-size:14px;color:black;font-weight:normal;">
-<p>-BIN Dağılımında her bin belirli bir skor aralığını temsil eder, en düşükten en yükseğe doğru sıralanır.
-<strong>Bin 1</strong> en düşük skorların bulunduğu aralığı, <strong>Bin 10</strong> en yüksek skorların bulunduğu aralığı içerir.</p>
-<p>-<strong>PSI</strong> değeri <strong>&lt;0.1</strong> ise iyi, <strong>0.1- 0.2</strong> arasında ise kabul edilebilir,
-<strong>0.2</strong>'nin üzeri değerler modelin performansının kötüleştiğini gösterir.</p>
-<p>-<strong>Gini</strong> değerinin <strong>0.4 ile 0.6</strong> arasında olması genellikle iyi, <strong>0.6</strong> üzeri olması çok iyi,
-<strong>0.4</strong> altı değerler ise kötü model performansına işaret eder.</p>
-<p>-PSI hesaplamasında <strong>2023</strong> yılının ilk <strong>3</strong> ayı baz alınmıştır.</p></div>"""
-
-bin_html = "".join(f"<h3>{BASLIK[s]}</h3>{bt[s].to_html()}" for s in SKORLAR)
-body = (f"<html><head>{CSS}</head><body><div>{warning_html}</div>{renkli_html(p)}<br>"
-        f"{bin_html}{ACIKLAMA}</body></html>")
-
-to, cc = ([SENDER], []) if TEST_MODU else (TO, CC)
-msg = MIMEMultipart()
-msg["From"], msg["To"], msg["Subject"] = SENDER, ",".join(to), SUBJECT
-if cc:
-    msg["Cc"] = ",".join(cc)
-msg.attach(MIMEText(body, "html", "utf-8"))
-with smtplib.SMTP(SMTP_HOST) as s:
-    s.sendmail(SENDER, to + cc, msg.as_string())
-print("Gönderildi:", SUBJECT, "->", to + cc, "| toplam süre:", datetime.now() - t0)
+WITH TEKIL AS (
+  SELECT ROW_NUMBER() OVER (PARTITION BY t1.KDS_BOUT_MBB_NO, TO_CHAR(t1.KDS_BOUT_ISLEM_ZAMANI,'YYYYMM')
+                            ORDER BY TRUNC(t1.KDS_BOUT_ISLEM_ZAMANI) DESC) AS SIRA,
+         TO_CHAR(t1.KDS_BOUT_ISLEM_ZAMANI,'YYYYMM') AS ISLEM_DONEM,
+         t1.KDS_BOUT_MBB_NO,
+         t1.KDS_BOUT_G1053     AS ONAY_RET,
+         t2.KDS_TON_ONAY_O5233 AS MM_SKOR,
+         t2.KDS_TON_ONAY_O0120 AS KKB_SKOR
+  FROM PODS.KDS_TON_ONAY_OUT_LOG t1
+  LEFT JOIN PKRA.KRA_TSM_BATCH_INPUT t2
+         ON t1.KDS_BOUT_SM_ID  = t2.KDS_TON_ONAY_SM_ID
+        AND t1.KDS_BOUT_MBB_NO = t2.KDS_TON_ONAY_MBB_NO
+  WHERE t1.KDS_BOUT_G5108 = 'YENI'
+    AND t1.KDS_BOUT_G1053 IN ('ONAY','RET')
+    AND t1.KDS_BOUT_ISLEM_ZAMANI >= DATE '2023-01-01'
+    AND t1.KDS_BOUT_ISLEM_ZAMANI <  TRUNC(SYSDATE,'MM')
+),
+TEKIL_G AS (
+  SELECT DISTINCT ROW_NUMBER() OVER (PARTITION BY t1.KDS_BOUT_MBB_NO, TO_CHAR(t1.KDS_BOUT_ISLEM_ZAMANI,'YYYYMM')
+                                     ORDER BY TRUNC(t1.KDS_BOUT_ISLEM_ZAMANI) DESC) AS SIRA,
+         t1.KDS_BOUT_ISLEM_ZAMANI,
+         TO_CHAR(t1.KDS_BOUT_ISLEM_ZAMANI,'YYYYMM') AS ISLEM_DONEM,
+         t1.KDS_BOUT_MBB_NO,
+         t1.KDS_BOUT_G1053
+  FROM PODS.KDS_TON_ONAY_OUT_LOG t1
+  LEFT JOIN PKRA.KRA_TSM_BATCH_INPUT t2
+         ON t1.KDS_BOUT_SM_ID  = t2.KDS_TON_ONAY_SM_ID
+        AND t1.KDS_BOUT_MBB_NO = t2.KDS_TON_ONAY_MBB_NO
+  WHERE t1.KDS_BOUT_ISLEM_ZAMANI >= DATE '2023-01-01'
+    AND t1.KDS_BOUT_G1053 = 'ONAY'
+    AND t1.KDS_BOUT_G5108 = 'YENI'
+),
+GEC AS (
+  SELECT KDS_BOUT_MBB_NO, ISLEM_DONEM,
+         CASE WHEN KK_GGS_4 > 60 THEN 1 ELSE 0 END                      AS KK_TAKIP_60_4,
+         CASE WHEN KK_GGS_12 > 90 OR KK_TAKIP_12 = 1 THEN 1 ELSE 0 END  AS KK_TAKIP_90_12
+  FROM (
+    SELECT KDS_BOUT_MBB_NO, ISLEM_DONEM,
+           MAX(CASE WHEN MONTH_TO_DLQ >= 0 AND MONTH_TO_DLQ <= 4  THEN IZL_HES_GEC_GUN ELSE 0 END) AS KK_GGS_4,
+           MAX(CASE WHEN MONTH_TO_DLQ >= 0 AND MONTH_TO_DLQ <= 12 THEN IZL_HES_GEC_GUN ELSE 0 END) AS KK_GGS_12,
+           MAX(CASE WHEN TKR_HES_ACLS_TAR IS NOT NULL AND TKR_HES_UYG_KOD IN ('AX0K','AE0K','VM0K')
+                     AND DT_DIFF >= 0 AND DT_DIFF <= 12 THEN 1 ELSE 0 END)                       AS KK_TAKIP_12
+    FROM (
+      SELECT A.*, B.*, C.*,
+             MONTHS_BETWEEN(C.TKR_HES_ACLS_TAR, A.KDS_BOUT_ISLEM_ZAMANI) AS DT_DIFF,
+             MONTHS_BETWEEN(B.IZL_HES_KYT_TAR,  A.KDS_BOUT_ISLEM_ZAMANI) AS MONTH_TO_DLQ
+      FROM (SELECT KDS_BOUT_ISLEM_ZAMANI, ISLEM_DONEM, KDS_BOUT_MBB_NO FROM TEKIL_G WHERE SIRA = 1) A
+      LEFT JOIN (
+        SELECT IZL_HES_MBB_NO, IZL_HES_KYT_TAR, MAX(IZL_HES_GEC_GUN) AS IZL_HES_GEC_GUN
+        FROM (
+          SELECT T0.*, T1.TICARI_KK_AP
+          FROM (SELECT IZL_HES_MBB_NO, IZL_HES_HES_NO, IZL_HES_KYT_TAR, IZL_HES_HES_TIP, IZL_HES_GEC_GUN
+                FROM PODS.IZL_THESAP_GUNLUK
+                WHERE IZL_HES_KYT_TAR >= DATE '2023-01-01' AND IZL_HES_HES_TIP IN ('KK')
+                UNION
+                SELECT IZL_HES_MBB_NO, IZL_HES_HES_NO, IZL_HES_KYT_TAR, IZL_HES_HES_TIP, IZL_HES_GEC_GUN
+                FROM PODS.IZL_THESAP_GUNLUK_ARSV
+                WHERE IZL_HES_KYT_TAR >= DATE '2023-01-01' AND IZL_HES_HES_TIP IN ('KK')) T0
+          LEFT JOIN (
+            SELECT * FROM (
+              SELECT HESAP_NUMARASI, URUN_TIPI,
+                     CASE WHEN URUN_TIPI = 5 THEN '000' || HESAP_NUMARASI ELSE HESAP_NUMARASI END AS HESAP_NUMARASI_2,
+                     CASE WHEN URUN_TIPI = 5 AND SUBSTR(HESAP_NUMARASI_FORMATTED,1,6) IN ('552608','552609','553056','425669') THEN 1
+                          WHEN URUN_TIPI = 3 AND MEVCUT_URUN_ID IN (528,529) THEN 1
+                          ELSE 0 END AS TICARI_KK_AP
+              FROM PDWH.DWH_THESAP)
+            WHERE TICARI_KK_AP = 1) T1
+            ON TRIM(T1.HESAP_NUMARASI_2) = TRIM(T0.IZL_HES_HES_NO)
+          WHERE TICARI_KK_AP IS NULL)
+        WHERE IZL_HES_HES_TIP = 'KK'
+        GROUP BY IZL_HES_MBB_NO, IZL_HES_KYT_TAR
+      ) B ON TO_NUMBER(A.KDS_BOUT_MBB_NO) = B.IZL_HES_MBB_NO
+         AND B.IZL_HES_KYT_TAR >= A.KDS_BOUT_ISLEM_ZAMANI
+      LEFT JOIN (
+        SELECT TKR_HES_MBB_NO, TKR_HES_ACLS_TAR, TKR_HES_UYG_KOD
+        FROM PODS.TKR_THESAP
+        WHERE TKR_HES_ACLS_TAR >= DATE '2023-01-01'
+      ) C ON TO_NUMBER(A.KDS_BOUT_MBB_NO) = C.TKR_HES_MBB_NO
+    ) D
+    GROUP BY KDS_BOUT_MBB_NO, ISLEM_DONEM
+  ) E
+)
+SELECT TO_NUMBER(t.ISLEM_DONEM)                       AS ISLEM_DONEM,
+       CASE WHEN t.ONAY_RET = 'ONAY' THEN 1 ELSE 0 END AS ONAY,
+       t.MM_SKOR, t.KKB_SKOR,
+       g.KK_TAKIP_60_4, g.KK_TAKIP_90_12
+FROM TEKIL t
+LEFT JOIN GEC g
+       ON g.KDS_BOUT_MBB_NO = t.KDS_BOUT_MBB_NO
+      AND g.ISLEM_DONEM     = t.ISLEM_DONEM
+WHERE t.SIRA = 1
